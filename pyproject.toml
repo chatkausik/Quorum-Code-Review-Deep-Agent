@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quorum-review"
+version = "0.1.0"
+description = "Quorum — a deep-agents orchestrator that reviews GitHub pull requests for correctness, security, and test-coverage issues"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "deepagents>=0.4.11",
+  "langchain-anthropic>=1.6.1",
+  "PyGithub>=2.5",
+  "unidiff>=0.7.5",
+  "streamlit>=1.40",
+  "python-dotenv>=1.0",
+  "bandit>=1.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
