@@ -46,7 +46,7 @@ conn = psycopg2.connect(host=os.environ["DB_HOST"], user=os.environ["DB_USER"],
 ```
 ```python
 # bad
-OPENAI_API_KEY = "sk-proj-REDACTEDEXAMPLEREDACTEDEXAMPLE"
+OPENAI_API_KEY = "sk-proj-8Kd0fJ2mNq7vX1pL4wR9tY6uI3oA5sE2"
 
 # good
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]

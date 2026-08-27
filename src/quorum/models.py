@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -29,6 +30,23 @@ class ReviewComment(BaseModel):
     anchor_text: str = Field(min_length=1, description="exact verbatim line of code")
     body: str
     suggestion: Optional[str] = None
+    title: Optional[str] = Field(
+        default=None, description="short noun phrase naming the issue"
+    )
+
+    def summary(self, limit: int = 78) -> str:
+        """A one-line label for the findings list.
+
+        Prefers an explicit title; otherwise takes the first sentence of the
+        body, so findings produced before `title` existed still read well.
+        """
+        if self.title and self.title.strip():
+            text = self.title.strip()
+        else:
+            first = re.split(r"(?<=[.!?])\s", self.body.strip(), maxsplit=1)[0]
+            text = first.strip() or self.body.strip()
+        text = " ".join(text.split())
+        return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
     def sort_key(self) -> tuple[int, int]:
         """Most severe first, then most confident."""

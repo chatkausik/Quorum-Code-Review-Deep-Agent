@@ -128,48 +128,77 @@ def file_lines(full_repo: str, path: str, ref: str) -> tuple[str, ...]:
     return get_file_lines(full_repo, path, ref)
 
 
-def render_detail(comment: ReviewComment, threshold: int, context, *, gated: bool) -> None:
-    """Detail pane: code in context, the explanation, and the proposed fix."""
+def _finding_body(comment: ReviewComment, context) -> None:
+    """Shared detail rendering: code in context, explanation, colour-coded fix."""
+    style = severity_style(comment.severity)
+    lines = file_lines(context.full_repo, comment.path, context.head_sha)
+
+    st.markdown(
+        f'<div class="cra-modal-sub">{comment.path}:{comment.line}</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        code_window(lines, comment.line, comment.anchor_text, color=style["color"]),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="cra-secheading">Why this matters</div>', unsafe_allow_html=True
+    )
+    st.markdown(comment.body)
+
+    if comment.suggestion:
+        st.markdown(
+            '<div class="cra-secheading fix">Suggested fix</div>'
+            + diff_block(comment.anchor_text.strip(), comment.suggestion.strip()),
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("No concrete fix was proposed for this finding.")
+
+
+@st.dialog(" ", width="large")
+def finding_dialog(comment: ReviewComment, threshold: int, context, gated: bool) -> None:
+    """Modal detail view opened by clicking a finding."""
     style = severity_style(comment.severity)
     conf_color = confidence_color(comment.confidence, threshold)
     meta = CATEGORY_META.get(comment.category, {"icon": "•", "label": comment.category})
 
-    lines = file_lines(context.full_repo, comment.path, context.head_sha)
-
     st.markdown(
-        f"""<div class="cra-detail-head" style="--sev:{style['color']};--sev-soft:{style['soft']}">
-  <span class="cra-badge" style="background:{style['color']}">{style['label']}</span>
-  <span class="cra-path">{comment.path}:{comment.line}</span>
-  <span class="cra-cat">{meta['icon']} {meta['label']}</span>
-  <span class="cra-conf">confidence
-    <span class="cra-bar"><span style="width:{comment.confidence}%;
-      background:{conf_color}"></span></span>
-    <b style="color:{conf_color}">{comment.confidence}</b>
-  </span>
-</div>{code_window(lines, comment.line, comment.anchor_text, color=style['color'])}
-<div class="cra-explain">{comment.body}</div>""",
+        f'<div class="cra-detail-head" style="--sev:{style["color"]};'
+        f'--sev-soft:{style["soft"]};border-radius:11px;border-bottom:'
+        f'1px solid rgba(140,150,170,.2)">'
+        f'<span class="cra-badge" style="background:{style["color"]}">'
+        f'{style["label"]}</span>'
+        f'<span class="cra-path">{comment.summary(90)}</span>'
+        f'<span class="cra-cat">{meta["icon"]} {meta["label"]}</span>'
+        f'<span class="cra-conf">confidence'
+        f'<span class="cra-bar"><span style="width:{comment.confidence}%;'
+        f'background:{conf_color}"></span></span>'
+        f'<b style="color:{conf_color}">{comment.confidence}</b></span></div>',
         unsafe_allow_html=True,
     )
+    _finding_body(comment, context)
 
-    if comment.suggestion:
-        st.markdown(
-            '<div class="cra-secheading">Suggested fix</div>'
-            + diff_block(comment.anchor_text.strip(), comment.suggestion.strip()),
-            unsafe_allow_html=True,
-        )
-
+    st.divider()
     key = f"approve::{finding_key(comment)}"
     st.checkbox(
         "Approve this comment" if gated else "Include when posting",
-        key=key,
+        key=f"dlg::{key}",
         value=st.session_state.get(key, not gated),
     )
+    if st.button("Save and close", type="primary", use_container_width=True):
+        st.session_state[key] = st.session_state[f"dlg::{key}"]
+        st.rerun()
 
 
 def render_bucket(
     comments: list[ReviewComment], threshold: int, context, *, gated: bool, slot: str
 ) -> None:
-    """Master/detail: pick a finding on the left, inspect it on the right."""
+    """Master/detail: scannable list on the left, live detail on the right.
+
+    Each row also opens a modal, for reading one finding without the list
+    competing for attention.
+    """
     sel_key = f"sel::{slot}"
     if st.session_state.get(sel_key, 0) >= len(comments):
         st.session_state[sel_key] = 0
@@ -178,29 +207,68 @@ def render_bucket(
     left, right = st.columns([2, 3], gap="medium")
 
     with left:
-        st.caption(f"{len(comments)} finding(s) — select to inspect")
+        st.caption(f"{len(comments)} finding(s) — click to inspect")
         for index, comment in enumerate(comments):
             style = severity_style(comment.severity)
+            meta = CATEGORY_META.get(comment.category, {"icon": "•"})
             st.markdown(
                 list_row(
-                    index, style["color"], style["label"], comment.path,
-                    comment.line, comment.confidence, index == selected,
+                    style["color"],
+                    style["label"],
+                    comment.summary(),
+                    comment.path,
+                    comment.line,
+                    comment.confidence,
+                    meta["icon"],
+                    confidence_color(comment.confidence, threshold),
+                    index == selected,
                 ),
                 unsafe_allow_html=True,
             )
-            approved = st.session_state.get(f"approve::{finding_key(comment)}", not gated)
-            if st.button(
-                ("✓ " if approved else "○ ") + f"{comment.category}",
-                key=f"pick::{slot}::{index}",
-                use_container_width=True,
-                type="primary" if index == selected else "secondary",
-            ):
-                st.session_state[sel_key] = index
-                st.rerun()
+            approved = st.session_state.get(
+                f"approve::{finding_key(comment)}", not gated
+            )
+            cols = st.columns([3, 2])
+            with cols[0]:
+                if st.button(
+                    "Open details",
+                    key=f"pick::{slot}::{index}",
+                    use_container_width=True,
+                    type="primary" if index == selected else "secondary",
+                ):
+                    st.session_state[sel_key] = index
+                    finding_dialog(comment, threshold, context, gated)
+            with cols[1]:
+                st.checkbox(
+                    "post",
+                    key=f"approve::{finding_key(comment)}",
+                    value=approved,
+                    help="Include this comment when posting to GitHub.",
+                )
 
     with right:
         if comments:
-            render_detail(comments[selected], threshold, context, gated=gated)
+            comment = comments[selected]
+            style = severity_style(comment.severity)
+            conf_color = confidence_color(comment.confidence, threshold)
+            meta = CATEGORY_META.get(
+                comment.category, {"icon": "•", "label": comment.category}
+            )
+            st.markdown(
+                f'<div class="cra-detail-head" style="--sev:{style["color"]};'
+                f'--sev-soft:{style["soft"]}">'
+                f'<span class="cra-badge" style="background:{style["color"]}">'
+                f'{style["label"]}</span>'
+                f'<span class="cra-path">{comment.summary(70)}</span>'
+                f'<span class="cra-cat">{meta["icon"]} {meta["label"]}</span>'
+                f'<span class="cra-conf">confidence'
+                f'<span class="cra-bar"><span style="width:{comment.confidence}%;'
+                f'background:{conf_color}"></span></span>'
+                f'<b style="color:{conf_color}">{comment.confidence}</b>'
+                f"</span></div>",
+                unsafe_allow_html=True,
+            )
+            _finding_body(comment, context)
 
 
 def approved_comments(comments: list[ReviewComment]) -> list[ReviewComment]:

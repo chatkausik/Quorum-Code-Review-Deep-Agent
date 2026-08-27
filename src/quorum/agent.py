@@ -217,6 +217,7 @@ def build_agent(
 _BODY_ALIASES = ("body", "comment", "message", "description", "issue", "detail")
 _SUGGESTION_ALIASES = ("suggestion", "fix", "suggested_fix", "recommendation")
 _ANCHOR_ALIASES = ("anchor_text", "anchor", "code", "line_text")
+_TITLE_ALIASES = ("title", "summary", "headline", "name", "issue_title")
 
 _SECURITY_HINTS = (
     "secret", "credential", "password", "token", "api key", "injection",
@@ -257,6 +258,9 @@ def normalize_finding(raw: dict) -> dict:
 
     suggestion = _first(raw, _SUGGESTION_ALIASES)
     normalized["suggestion"] = str(suggestion) if suggestion is not None else None
+
+    title = _first(raw, _TITLE_ALIASES)
+    normalized["title"] = str(title) if title is not None else None
 
     category = str(normalized.get("category", "")).lower()
     if category not in ("correctness", "security", "tests"):

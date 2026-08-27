@@ -58,7 +58,8 @@ request for correctness, security vulnerabilities, and test coverage gaps.
 7. OUTPUT FINDINGS — emit the marker {FINAL_MARKER} on its own line,
    followed by the JSON array. No extra text after the array.
    Each element MUST use exactly these field names:
-   path, line, severity, category, confidence, anchor_text, body, suggestion.
+   path, line, severity, category, confidence, anchor_text, title, body,
+   suggestion.
    Use "body" for the prose — never "comment" or "message" — and always
    include "category" (correctness, security, or tests).
 
@@ -94,7 +95,7 @@ test coverage. You will be given a file path mounted in the virtual filesystem.
 
 ## Produce findings
 For each issue found: path, line, severity, category, confidence (0-100),
-anchor_text (REQUIRED), body, suggestion (optional).
+anchor_text (REQUIRED), title (short noun phrase), body, suggestion (optional).
 The `path` must be the file's REAL repository path as given in your task
 description, never the /pr/ virtual path.
 Do not report severity='low'. Omit findings with confidence below 50.
@@ -112,6 +113,7 @@ required on every finding:
       "category": "security",
       "confidence": 95,
       "anchor_text": "    cursor.execute(f\"SELECT * FROM users WHERE id = {{uid}}\")",
+      "title": "SQL injection via f-string interpolation",
       "body": "User input is interpolated directly into SQL.",
       "suggestion": "cursor.execute(\"SELECT * FROM users WHERE id = %s\", (uid,))"
     }}
@@ -119,6 +121,9 @@ required on every finding:
 }}
 severity is one of: low, medium, high, critical.
 category is one of: correctness, security, tests.
+title is a SHORT noun phrase (3-8 words) naming the issue, e.g. "Hardcoded
+database password" or "Blocking HTTP call inside coroutine". It is the label a
+reviewer scans in a list, so make it specific and never a full sentence.
 If no issues: {{ "comments": [] }}
 
 ## Return a summary
@@ -160,6 +165,7 @@ required on every finding:
       "category": "security",
       "confidence": 95,
       "anchor_text": "    cursor.execute(f\"SELECT * FROM users WHERE id = {{uid}}\")",
+      "title": "SQL injection via f-string interpolation",
       "body": "User input is interpolated directly into SQL.",
       "suggestion": "cursor.execute(\"SELECT * FROM users WHERE id = %s\", (uid,))"
     }}
@@ -167,6 +173,9 @@ required on every finding:
 }}
 severity is one of: low, medium, high, critical.
 category is one of: correctness, security, tests.
+title is a SHORT noun phrase (3-8 words) naming the issue, e.g. "Hardcoded
+database password" or "Blocking HTTP call inside coroutine". It is the label a
+reviewer scans in a list, so make it specific and never a full sentence.
 If no issues: {{ "comments": [] }}
 
 ## Return a summary

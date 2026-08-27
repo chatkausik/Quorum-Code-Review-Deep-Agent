@@ -100,7 +100,7 @@ or `secretKeyRef` against a secret provisioned outside the repository.
 ```
 ```yaml
 # bad
-- run: curl -H "Authorization: Bearer ghp_REDACTEDEXAMPLEREDACTEDEXAMPLE0001"
+- run: curl -H "Authorization: Bearer ghp_R2d2C3poX1y9Z8w7V6u5T4s3R2q1P0oN9m8L"
 
 # good
 - run: curl -H "Authorization: Bearer $GITHUB_TOKEN"
