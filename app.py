@@ -30,7 +30,11 @@ from quorum.memory import FileBackedStore
 from quorum.models import SEVERITY_ORDER, ReviewComment
 from quorum.observability import project_url
 from quorum.reporting import build_report
-from quorum.tools.github_tools import get_file_lines, post_approved_review
+from quorum.tools.github_tools import (
+    get_file_lines,
+    post_approved_review,
+    validate_target,
+)
 from quorum.ui_theme import (
     CATEGORY_META,
     feed,
@@ -251,8 +255,8 @@ def approved_comments(comments: list[ReviewComment]) -> list[ReviewComment]:
 
 with st.sidebar:
     st.header("Review a pull request")
-    owner = st.text_input("Owner", placeholder="octocat")
-    repo = st.text_input("Repository", placeholder="hello-world")
+    owner = st.text_input("Owner", placeholder="octocat").strip()
+    repo = st.text_input("Repository", placeholder="hello-world").strip()
     pr_number = st.number_input("PR number", min_value=1, step=1, value=1)
     threshold = st.number_input(
         "Confidence threshold",
@@ -312,8 +316,11 @@ hero()
 # --------------------------------------------------------------------------
 
 if run_clicked:
-    if not owner or not repo:
-        st.error("Enter an owner and a repository.")
+    target_problem = validate_target(owner, repo) if (owner or repo) else (
+        "Enter an owner and a repository."
+    )
+    if target_problem:
+        st.error(target_problem)
     else:
         for key in [k for k in st.session_state if k.startswith("approve::")]:
             del st.session_state[key]
@@ -374,6 +381,10 @@ if run_clicked:
                     state="complete",
                     expanded=False,
                 )
+            except LookupError as exc:
+                st.session_state.result = None
+                status.update(label=f"Could not find {target}", state="error")
+                st.error(str(exc))
             except Exception as exc:  # noqa: BLE001 - surface any failure in the UI
                 st.session_state.result = None
                 status.update(label=f"Review failed — {target}", state="error")

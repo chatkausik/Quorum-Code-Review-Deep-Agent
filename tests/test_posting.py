@@ -454,3 +454,39 @@ class TestMergeRecovery:
             "/findings/b.json": {"content": json.dumps({"comments": [self._raw(5)]})},
         }
         assert len(parse_findings_files(files, Counter(), set())) == 1
+
+
+class TestTargetValidation:
+    """A mistyped owner must fail fast with a specific message, not a raw 404."""
+
+    @pytest.mark.parametrize(
+        "owner,repo,fragment",
+        [
+            ("Agentic AI", "Evidensia.AI", "contains a space"),
+            ("chatkausik", "My Repo", "contains a space"),
+            (" chatkausik", "x", "whitespace"),
+            ("", "x", "empty"),
+            ("chatkausik", "", "empty"),
+            ("bad/owner", "x", "not a valid GitHub name"),
+            ("owner", "re;po", "not a valid GitHub name"),
+        ],
+    )
+    def test_rejects_bad_targets(self, owner, repo, fragment):
+        from quorum.tools.github_tools import validate_target
+
+        problem = validate_target(owner, repo)
+        assert problem is not None
+        assert fragment in problem
+
+    @pytest.mark.parametrize(
+        "owner,repo",
+        [
+            ("chatkausik", "Evidensia.AI"),
+            ("psf", "requests"),
+            ("my-org", "some_repo.v2"),
+        ],
+    )
+    def test_accepts_valid_targets(self, owner, repo):
+        from quorum.tools.github_tools import validate_target
+
+        assert validate_target(owner, repo) is None

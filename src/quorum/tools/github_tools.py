@@ -7,6 +7,7 @@ posting authority never belongs to the agent.
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 from pathlib import PurePosixPath
 
@@ -66,13 +67,69 @@ def should_skip(path: str, review_docs: bool | None = None) -> bool:
     return is_doc(path) and not allow_docs
 
 
+VALID_SLUG = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def validate_target(owner: str, repo: str) -> str | None:
+    """Return a human-readable problem with owner/repo, or None if it looks sane.
+
+    Catching this before any API call turns a bare 404 into a specific,
+    actionable message.
+    """
+    for label, value in (("Owner", owner), ("Repository", repo)):
+        if not value or not value.strip():
+            return f"{label} is empty."
+        if value != value.strip():
+            return f"{label} has leading or trailing whitespace."
+        if " " in value:
+            return (
+                f"{label} contains a space: {value!r}. GitHub owners and "
+                "repository names never contain spaces — this looks like a "
+                "display name or folder name rather than the URL slug."
+            )
+        if not VALID_SLUG.match(value):
+            return (
+                f"{label} {value!r} is not a valid GitHub name. Use the slug "
+                "exactly as it appears in the repository URL."
+            )
+    return None
+
+
 def load_pr_context(owner: str, repo: str, pr_number: int) -> ReviewContext:
     """Fetch PR metadata deterministically, before the agent starts.
 
     This is what PRMetadataMiddleware injects and what the post step trusts for
     the head SHA — neither depends on the LLM reporting them correctly.
     """
-    pull = _client().get_repo(f"{owner}/{repo}").get_pull(pr_number)
+    problem = validate_target(owner, repo)
+    if problem:
+        raise LookupError(problem)
+
+    full = f"{owner}/{repo}"
+    try:
+        repository = _client().get_repo(full)
+    except GithubException as exc:
+        if exc.status == 404:
+            raise LookupError(
+                f"No repository at github.com/{full}.\n\n"
+                "Either it does not exist, or the token cannot see it. Check:\n"
+                "  • the owner and repository are the URL slugs, not display names\n"
+                "  • spelling and capitalisation\n"
+                "  • for a private repo, that the token has access to it "
+                "(fine-grained tokens must list it under Repository access)"
+            ) from exc
+        raise
+
+    try:
+        pull = repository.get_pull(pr_number)
+    except GithubException as exc:
+        if exc.status == 404:
+            raise LookupError(
+                f"{full} exists, but it has no pull request #{pr_number}. "
+                "Check the PR number — issues and pull requests share a "
+                "numbering sequence, so an issue number will 404 here."
+            ) from exc
+        raise
     return ReviewContext(
         owner=owner,
         repo=repo,
