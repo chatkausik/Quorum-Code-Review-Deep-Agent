@@ -100,6 +100,7 @@ class ReviewResult:
     # LangSmith links, populated only when tracing is enabled.
     trace_url: str | None = None
     project_url: str | None = None
+    files_reviewed: int = 0
 
     def __post_init__(self) -> None:
         if self.trace is None:

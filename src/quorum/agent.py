@@ -565,19 +565,30 @@ def run_review(
             emit({"type": "log", "phase": "plan", "icon": "🚀",
                   "text": f"Starting review of {context.full_repo}#{pr_number}",
                   "detail": context.title[:110]})
-            for chunk in agent.stream(
+            # "values" carries the accumulated state on every step, so the
+            # final findings are captured as they stream. Relying only on a
+            # post-hoc checkpoint read made a failed read look identical to a
+            # run that genuinely found nothing.
+            for mode, chunk in agent.stream(
                 {"messages": [{"role": "user", "content": task}]},
                 config=run_config,
-                stream_mode="updates",
+                stream_mode=["updates", "values"],
             ):
+                if mode == "values":
+                    if isinstance(chunk, dict) and chunk:
+                        state = chunk
+                    continue
                 for node, update in (chunk or {}).items():
                     for event in _describe_update(node, update):
                         emit({"type": "log", **event})
                 if cost.calls:
                     emit({"type": "stats", **cost.snapshot()})
-            # Streaming yields incremental updates, not the accumulated state;
-            # the checkpointer holds the complete final state.
-            state = _recover_state(agent, run_config)
+
+            if not state.get("files"):
+                # Streaming gave us nothing usable; fall back to the checkpoint.
+                recovered = _recover_state(agent, run_config)
+                if recovered:
+                    state = recovered
     except BudgetExceeded as exc:
         budget_exceeded = True
         error = str(exc)
@@ -600,6 +611,15 @@ def run_review(
         )
 
     comments.sort(key=lambda c: c.sort_key())
+
+    if not state and error is None:
+        error = (
+            "The run finished but its final state could not be read, so any "
+            "findings it produced were lost. This is a bug, not a clean bill "
+            "of health — re-run before trusting a zero-finding result."
+        )
+        logger.error("Empty final state after a successful stream")
+
     store.record_run(owner, repo)
 
     return ReviewResult(
@@ -614,6 +634,9 @@ def run_review(
         subagent_reported=_count_subagent_findings(state) if state else 0,
         trace_url=trace.get("url"),
         project_url=project_url(),
+        files_reviewed=sum(
+            1 for path in (state.get("files") or {}) if path.startswith("/pr/")
+        ),
     )
 
 

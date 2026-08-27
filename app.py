@@ -447,15 +447,23 @@ else:
             unsafe_allow_html=True,
         )
 
-    if result.subagent_reported and not result.comments:
+    if not result.comments:
         summary = result.drop_summary()
-        st.info(
-            f"Subagents reported {result.subagent_reported} candidate finding(s), "
-            "but none reached the final list"
-            + (f" — filtered: {summary}." if summary else ".")
-            + "  \nLow-severity findings are never reported, and duplicates on "
-            "the same line are merged."
-        )
+        if result.subagent_reported:
+            st.info(
+                f"Subagents reported {result.subagent_reported} candidate "
+                "finding(s), but none reached the final list"
+                + (f" — filtered: {summary}." if summary else ".")
+                + "  \nLow-severity findings are never reported, and duplicates "
+                "on the same line are merged."
+            )
+        elif result.files_reviewed:
+            st.success(
+                f"Reviewed {result.files_reviewed} file(s) and found nothing "
+                "above the reporting bar. Low-severity issues are never "
+                "reported."
+            )
+        # A run with no files and no findings already surfaced an error above.
     elif result.dropped:
         st.caption(f"Filtered during consolidation: {result.drop_summary()}.")
 
