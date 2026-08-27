@@ -44,7 +44,6 @@ from quorum.ui_theme import (
     code_window,
     confidence_color,
     diff_block,
-    list_row,
     severity_style,
 )
 
@@ -181,94 +180,63 @@ def finding_dialog(comment: ReviewComment, threshold: int, context, gated: bool)
 
     st.divider()
     key = f"approve::{finding_key(comment)}"
-    st.checkbox(
-        "Approve this comment" if gated else "Include when posting",
-        key=f"dlg::{key}",
-        value=st.session_state.get(key, not gated),
+    posting = st.session_state.get(key, not gated)
+    st.caption(
+        ("✅ Selected for posting." if posting else "⬜ Not selected for posting.")
+        + "  Use the checkbox beside the row to change this."
     )
-    if st.button("Save and close", type="primary", use_container_width=True):
-        st.session_state[key] = st.session_state[f"dlg::{key}"]
+    if st.button("Close", use_container_width=True):
         st.rerun()
+
+
+SEVERITY_DOT = {
+    "critical": "🔴",
+    "high": "🟠",
+    "medium": "🟡",
+    "low": "⚪",
+}
 
 
 def render_bucket(
     comments: list[ReviewComment], threshold: int, context, *, gated: bool, slot: str
 ) -> None:
-    """Master/detail: scannable list on the left, live detail on the right.
+    """One line per finding: tick to post, click the row for full detail.
 
-    Each row also opens a modal, for reading one finding without the list
-    competing for attention.
+    The list is the whole view — detail lives in a modal, so a long finding
+    never pushes the next one off the screen.
     """
-    sel_key = f"sel::{slot}"
-    if st.session_state.get(sel_key, 0) >= len(comments):
-        st.session_state[sel_key] = 0
-    selected = st.session_state.get(sel_key, 0)
+    header = st.columns([0.05, 0.95])
+    header[0].caption("post")
+    header[1].caption(f"{len(comments)} finding(s) — click a row for details")
 
-    left, right = st.columns([2, 3], gap="medium")
+    for index, comment in enumerate(comments):
+        row = st.columns([0.05, 0.95], vertical_alignment="center")
+        key = f"approve::{finding_key(comment)}"
 
-    with left:
-        st.caption(f"{len(comments)} finding(s) — click to inspect")
-        for index, comment in enumerate(comments):
-            style = severity_style(comment.severity)
-            meta = CATEGORY_META.get(comment.category, {"icon": "•"})
-            st.markdown(
-                list_row(
-                    style["color"],
-                    style["label"],
-                    comment.summary(),
-                    comment.path,
-                    comment.line,
-                    comment.confidence,
-                    meta["icon"],
-                    confidence_color(comment.confidence, threshold),
-                    index == selected,
-                ),
-                unsafe_allow_html=True,
+        with row[0]:
+            st.checkbox(
+                "post",
+                key=key,
+                value=st.session_state.get(key, not gated),
+                label_visibility="collapsed",
+                help="Include this comment when posting to GitHub.",
             )
-            approved = st.session_state.get(
-                f"approve::{finding_key(comment)}", not gated
+        with row[1]:
+            dot = SEVERITY_DOT.get(comment.severity, "⚪")
+            # Non-breaking space: a plain space between the emoji and the
+            # bold span gets collapsed in the rendered label.
+            label = (
+                f"{dot}\u00a0\u00a0**{comment.summary(86)}** \u00b7 "
+                f"`{comment.path.rsplit('/', 1)[-1]}:{comment.line}` \u00b7 "
+                f"{comment.confidence}"
             )
-            cols = st.columns([3, 2])
-            with cols[0]:
-                if st.button(
-                    "Open details",
-                    key=f"pick::{slot}::{index}",
-                    use_container_width=True,
-                    type="primary" if index == selected else "secondary",
-                ):
-                    st.session_state[sel_key] = index
-                    finding_dialog(comment, threshold, context, gated)
-            with cols[1]:
-                st.checkbox(
-                    "post",
-                    key=f"approve::{finding_key(comment)}",
-                    value=approved,
-                    help="Include this comment when posting to GitHub.",
-                )
-
-    with right:
-        if comments:
-            comment = comments[selected]
-            style = severity_style(comment.severity)
-            conf_color = confidence_color(comment.confidence, threshold)
-            meta = CATEGORY_META.get(
-                comment.category, {"icon": "•", "label": comment.category}
-            )
-            st.markdown(
-                f'<div class="cra-detail-head" style="--sev:{style["color"]};'
-                f'--sev-soft:{style["soft"]}">'
-                f'<span class="cra-badge" style="background:{style["color"]}">'
-                f'{style["label"]}</span>'
-                f'<span class="cra-path">{comment.summary(70)}</span>'
-                f'<span class="cra-cat">{meta["icon"]} {meta["label"]}</span>'
-                f'<span class="cra-conf">confidence'
-                f'<span class="cra-bar"><span style="width:{comment.confidence}%;'
-                f'background:{conf_color}"></span></span>'
-                f'<b style="color:{conf_color}">{comment.confidence}</b>'
-                f"</span></div>",
-                unsafe_allow_html=True,
-            )
-            _finding_body(comment, context)
+            if st.button(
+                label,
+                key=f"pick::{slot}::{index}",
+                use_container_width=True,
+                wrap=False,
+            ):
+                finding_dialog(comment, threshold, context, gated)
 
 
 def approved_comments(comments: list[ReviewComment]) -> list[ReviewComment]:

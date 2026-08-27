@@ -325,29 +325,6 @@ CSS = """
     opacity: .55; font-weight: 700; margin: .9rem 0 .3rem;
   }
 
-  /* ---------- findings list row ---------- */
-  .cra-lrow {
-    border-left: 3px solid transparent; border-radius: 0 9px 9px 0;
-    padding: .5rem .65rem .55rem; margin-bottom: .1rem;
-  }
-  .cra-lrow-top {
-    display: flex; align-items: center; gap: .45rem; margin-bottom: .22rem;
-  }
-  .cra-lchip {
-    font-size: .6rem; font-weight: 800; letter-spacing: .07em;
-    padding: .12rem .4rem; border-radius: 5px;
-  }
-  .cra-lcat { font-size: .74rem; opacity: .75; }
-  .cra-lconf { margin-left: auto; font-size: .72rem; font-weight: 750; }
-  .cra-ltitle {
-    font-size: .855rem; font-weight: 620; line-height: 1.36; margin-bottom: .12rem;
-  }
-  .cra-lpath {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: .7rem; opacity: .56;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-
   /* ---------- modal ---------- */
   .cra-modal-sub {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -359,6 +336,33 @@ CSS = """
     font-size: .87rem; line-height: 1.55;
   }
   .cra-secheading.fix { color: #5FBF97; opacity: .9; }
+
+  /* Finding rows are buttons, but must read as list rows: left-aligned,
+     full width, quiet until hovered. Scoped by widget key so the sidebar's
+     centred action buttons are untouched. */
+  [class*="st-key-pick--"] button {
+    justify-content: flex-start !important;
+    text-align: left !important;
+    padding: .45rem .8rem !important;
+    border-color: rgba(140,150,170,.22) !important;
+  }
+  /* Streamlit nests a flex div+span inside the button, both centred and
+     shrink-wrapped; the button's own justify-content cannot reach them. */
+  [class*="st-key-pick--"] button > div,
+  [class*="st-key-pick--"] button > div > span {
+    justify-content: flex-start !important;
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  [class*="st-key-pick--"] button p {
+    text-align: left !important;
+    width: 100%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  [class*="st-key-pick--"] button:hover {
+    border-color: rgba(140,150,170,.5) !important;
+    background: rgba(140,150,170,.08) !important;
+  }
 
   section[data-testid="stSidebar"] .stButton button { font-weight: 650; }
 </style>
@@ -506,34 +510,4 @@ def code_block(anchor_text: str, line: int) -> str:
         f'<div class="cra-snip"><div class="cra-srow">'
         f'<span class="cra-sln">{line}</span>'
         f'<span class="cra-stx">{html.escape(anchor_text)}</span></div></div>'
-    )
-
-
-def list_row(
-    severity_color: str,
-    severity_label: str,
-    title: str,
-    path: str,
-    line: int,
-    confidence: int,
-    category_icon: str,
-    conf_color: str,
-    selected: bool,
-) -> str:
-    """One scannable row: what the issue is, where it is, and how sure we are."""
-    bg = "rgba(140,150,170,.13)" if selected else "transparent"
-    ring = "box-shadow:inset 0 0 0 1px rgba(140,150,170,.28);" if selected else ""
-    chip_bg = f"color-mix(in srgb, {severity_color} 16%, transparent)"
-    return (
-        f'<div class="cra-lrow" style="border-left-color:{severity_color};'
-        f'background:{bg};{ring}">'
-        f'<div class="cra-lrow-top">'
-        f'<span class="cra-lchip" style="color:{severity_color};'
-        f'background:{chip_bg}">{severity_label}</span>'
-        f'<span class="cra-lcat">{category_icon}</span>'
-        f'<span class="cra-lconf" style="color:{conf_color}">{confidence}</span>'
-        f"</div>"
-        f'<div class="cra-ltitle">{html.escape(title)}</div>'
-        f'<div class="cra-lpath">{html.escape(path.rsplit("/", 1)[-1])}:{line}</div>'
-        f"</div>"
     )

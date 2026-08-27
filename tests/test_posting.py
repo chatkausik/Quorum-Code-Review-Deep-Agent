@@ -390,3 +390,67 @@ class TestTokenResolution:
         assert cfg._gh_cli_token() == "gho_from_keyring"
         assert "GITHUB_TOKEN" not in captured["env"]
         assert "GH_TOKEN" not in captured["env"]
+
+
+class TestMergeRecovery:
+    """A consolidation slip must not silently lose a subagent's finding."""
+
+    def _raw(self, line, **over):
+        base = {
+            "path": "a.py", "line": line, "severity": "high", "category": "security",
+            "confidence": 90, "anchor_text": f"line{line}", "body": "Issue.",
+        }
+        base.update(over)
+        return base
+
+    def test_findings_files_supplement_the_marker(self):
+        import json
+        from collections import Counter
+
+        from quorum.agent import parse_findings_files, parse_marker_output
+        from quorum.config import FINAL_MARKER
+
+        marker_text = f"{FINAL_MARKER}\n{json.dumps([self._raw(1)])}"
+        files = {
+            "/findings/a.json": {
+                "content": json.dumps(
+                    {"comments": [self._raw(1), self._raw(2), self._raw(3)]}
+                )
+            }
+        }
+        seen: set = set()
+        dropped: Counter = Counter()
+        from_marker = parse_marker_output(marker_text, dropped, seen)
+        recovered = parse_findings_files(files, dropped, seen)
+
+        assert len(from_marker) == 1
+        # Line 1 is already seen, so only 2 and 3 are recovered — no duplicates.
+        assert [c.line for c in recovered] == [2, 3]
+        assert len(from_marker + recovered) == 3
+
+    def test_recovery_still_drops_low_severity(self):
+        import json
+        from collections import Counter
+
+        from quorum.agent import parse_findings_files
+
+        files = {
+            "/findings/a.json": {
+                "content": json.dumps({"comments": [self._raw(9, severity="low")]})
+            }
+        }
+        dropped: Counter = Counter()
+        assert parse_findings_files(files, dropped, set()) == []
+        assert dropped["low severity"] == 1
+
+    def test_shared_seen_prevents_double_counting(self):
+        import json
+        from collections import Counter
+
+        from quorum.agent import parse_findings_files
+
+        files = {
+            "/findings/a.json": {"content": json.dumps({"comments": [self._raw(5)]})},
+            "/findings/b.json": {"content": json.dumps({"comments": [self._raw(5)]})},
+        }
+        assert len(parse_findings_files(files, Counter(), set())) == 1

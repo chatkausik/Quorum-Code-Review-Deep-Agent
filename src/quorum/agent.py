@@ -324,7 +324,9 @@ def _coerce(
 
 
 def parse_marker_output(
-    text: str, dropped: Counter | None = None
+    text: str,
+    dropped: Counter | None = None,
+    seen: set[tuple[str, int]] | None = None,
 ) -> list[ReviewComment]:
     """Extract findings from the FINAL_FINDINGS_JSON marker in the final message."""
     if FINAL_MARKER not in text:
@@ -343,12 +345,14 @@ def parse_marker_output(
         logger.warning("FINAL_FINDINGS_JSON was not valid JSON: %s", exc)
         return []
 
-    seen: set[tuple[str, int]] = set()
+    seen = set() if seen is None else seen
     return [c for item in raw_items if (c := _coerce(item, seen, dropped))]
 
 
 def parse_findings_files(
-    files: dict[str, Any], dropped: Counter | None = None
+    files: dict[str, Any],
+    dropped: Counter | None = None,
+    seen: set[tuple[str, int]] | None = None,
 ) -> list[ReviewComment]:
     """Fallback: consolidate /findings/*.json straight out of the final state.
 
@@ -356,7 +360,7 @@ def parse_findings_files(
     subagent output on the floor. Deterministic, so a failed final message
     never costs a whole run's work.
     """
-    seen: set[tuple[str, int]] = set()
+    seen = set() if seen is None else seen
     collected: list[ReviewComment] = []
     for path, data in (files or {}).items():
         if not path.startswith(FINDINGS_DIR) or not path.endswith(".json"):
@@ -599,16 +603,22 @@ def run_review(
         logger.exception("Review failed")
         state = _recover_state(agent, run_config)
 
+    # The orchestrator's consolidated list is authoritative for wording, but it
+    # sometimes drops findings its own subagents wrote. Merging the raw
+    # /findings files back in — deduped by (path, line) — means a consolidation
+    # slip can no longer silently lose a real issue. Low severity and
+    # duplicates are still filtered by _coerce.
     dropped: Counter = Counter()
-    comments = parse_marker_output(_final_text(state), dropped) if state else []
-    if not comments:
-        # Marker missing, malformed, or the run was killed mid-flight. Reset the
-        # counter so the fallback's reasons replace the marker pass's rather
-        # than double-counting the same findings.
-        dropped.clear()
-        comments = (
-            parse_findings_files(state.get("files", {}), dropped) if state else []
+    seen: set[tuple[str, int]] = set()
+    comments = parse_marker_output(_final_text(state), dropped, seen) if state else []
+    recovered = (
+        parse_findings_files(state.get("files", {}), dropped, seen) if state else []
+    )
+    if recovered:
+        logger.info(
+            "Recovered %d finding(s) the consolidation step omitted", len(recovered)
         )
+    comments = comments + recovered
 
     comments.sort(key=lambda c: c.sort_key())
 
@@ -634,6 +644,7 @@ def run_review(
         subagent_reported=_count_subagent_findings(state) if state else 0,
         trace_url=trace.get("url"),
         project_url=project_url(),
+        recovered_from_files=len(recovered),
         files_reviewed=sum(
             1 for path in (state.get("files") or {}) if path.startswith("/pr/")
         ),

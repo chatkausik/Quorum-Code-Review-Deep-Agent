@@ -101,6 +101,8 @@ class ReviewResult:
     trace_url: str | None = None
     project_url: str | None = None
     files_reviewed: int = 0
+    # Findings the consolidation step omitted, recovered from /findings.
+    recovered_from_files: int = 0
 
     def __post_init__(self) -> None:
         if self.trace is None:
