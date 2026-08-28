@@ -16,6 +16,8 @@ with its AI-review attribution, severity, and category.
 
 ## How it works
 
+![Quorum architecture — frozen source, deep-agent orchestrator, confidence-gated approval, deterministic posting](docs/images/quorum-architecture.png)
+
 ```
 Streamlit UI  ──run_review()──▶  Deep Agent Orchestrator (configured model)
                                           ▲
