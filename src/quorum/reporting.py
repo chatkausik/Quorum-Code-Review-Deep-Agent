@@ -55,6 +55,18 @@ def build_report(result: ReviewResult, threshold: int) -> str:
             "may be incomplete.",
         ]
 
+    failed_checks = [check for check in result.health_checks if not check.passed]
+    lines += ["", "## Review Health", ""]
+    if not failed_checks:
+        lines.append(f"All {len(result.health_checks)} deterministic checks passed.")
+    else:
+        lines.append(
+            f"{len(failed_checks)} of {len(result.health_checks)} deterministic checks failed:"
+        )
+        lines.append("")
+        for check in failed_checks:
+            lines.append(f"- **{check.name}** ({check.severity}): {check.detail}")
+
     lines += ["", "## Findings", ""]
     if not comments:
         lines.append("No findings above the reporting bar.")

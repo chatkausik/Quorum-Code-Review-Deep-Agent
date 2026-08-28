@@ -30,7 +30,7 @@ class TestPricing:
         [
             ("claude-opus-5", (5.00, 25.00)),
             ("claude-opus-5-20260101", (5.00, 25.00)),
-            ("claude-sonnet-5", (3.00, 15.00)),
+            ("claude-sonnet-5", (2.00, 10.00)),
             ("claude-haiku-4-5", (1.00, 5.00)),
         ],
     )
@@ -65,7 +65,7 @@ class TestCostCeiling:
     def test_cost_is_accumulated_accurately(self):
         cost = CostTrackingMiddleware(max_cost_usd=1000.0)
         cost.record("claude-sonnet-5", 1_000_000, 1_000_000)
-        assert cost.total_cost_usd == pytest.approx(18.00, rel=1e-6)
+        assert cost.total_cost_usd == pytest.approx(12.00, rel=1e-6)
 
     def test_call_ceiling_halts_the_run(self):
         cost = CostTrackingMiddleware(max_cost_usd=1000.0, max_calls=25)
@@ -142,8 +142,9 @@ class TestPRMetadata:
         PRMetadataMiddleware(CONTEXT).wrap_model_call(request, lambda r: r)
         content = captured["system_message"].content
         assert "acme/widgets" in content
-        assert "Add checkout flow" in content
         assert "abc123" in content
+        assert "untrusted data" in content
+        assert "Add checkout flow" not in content
 
     def test_the_existing_system_prompt_is_preserved(self):
         request, captured = self._request("You are an orchestrator.")
@@ -159,12 +160,15 @@ class TestPRMetadata:
 
     def test_missing_description_is_handled(self):
         ctx = ReviewContext(
-            owner="a", repo="b", pr_number=1, title="T", body="",
+            owner="a", repo="b", pr_number=1, title="UNTRUSTED_TITLE_VALUE", body="",
             head_sha="s", base_sha="t", author="u",
         )
         request, captured = self._request()
         PRMetadataMiddleware(ctx).wrap_model_call(request, lambda r: r)
-        assert "(no description provided)" in captured["system_message"].content
+        content = captured["system_message"].content
+        assert "a/b" in content
+        assert "Human-selected pull request boundary" in content
+        assert "UNTRUSTED_TITLE_VALUE" not in content
 
     def test_no_system_prompt_still_injects(self):
         request, captured = self._request(system="")
@@ -178,8 +182,8 @@ class TestCachePricing:
     def test_cache_reads_are_priced_at_a_tenth(self):
         cost = CostTrackingMiddleware(max_cost_usd=1000.0)
         cost.record("claude-sonnet-5", 1_000_000, 0, cache_read=1_000_000)
-        # $3.00/MTok base × 0.1 = $0.30, not $3.00.
-        assert cost.total_cost_usd == pytest.approx(0.30, rel=1e-6)
+        # $2.00/MTok base × 0.1 = $0.20, not $2.00.
+        assert cost.total_cost_usd == pytest.approx(0.20, rel=1e-6)
 
     def test_cache_writes_use_the_provider_multiplier(self):
         from quorum.config import CACHE_WRITE_MULTIPLIER
@@ -187,7 +191,7 @@ class TestCachePricing:
         cost = CostTrackingMiddleware(max_cost_usd=1000.0)
         cost.record("claude-sonnet-5", 1_000_000, 0, cache_write=1_000_000)
         assert cost.total_cost_usd == pytest.approx(
-            3.00 * CACHE_WRITE_MULTIPLIER, abs=1e-9
+            2.00 * CACHE_WRITE_MULTIPLIER, abs=1e-9
         )
 
     def test_tiers_are_not_double_counted(self):
@@ -200,9 +204,9 @@ class TestCachePricing:
         )
 
         expected = (
-            (10_000 / 1e6) * 3.00
-            + (70_000 / 1e6) * 3.00 * CACHE_READ_MULTIPLIER
-            + (20_000 / 1e6) * 3.00 * CACHE_WRITE_MULTIPLIER
+            (10_000 / 1e6) * 2.00
+            + (70_000 / 1e6) * 2.00 * CACHE_READ_MULTIPLIER
+            + (20_000 / 1e6) * 2.00 * CACHE_WRITE_MULTIPLIER
         )
         assert cost.total_cost_usd == pytest.approx(expected, rel=1e-6)
 

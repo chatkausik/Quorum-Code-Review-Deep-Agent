@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -120,7 +121,7 @@ PRICING: dict[str, tuple[float, float]] = {
     "gpt-4o": (2.50, 10.00),
     # Anthropic
     "claude-opus-5": (5.00, 25.00),
-    "claude-sonnet-5": (3.00, 15.00),
+    "claude-sonnet-5": (2.00, 10.00),
     "claude-haiku-4-5": (1.00, 5.00),
 }
 # Used when a model id is missing from PRICING, so an unknown model can never
@@ -147,6 +148,9 @@ MEMORY_DIR = Path(
 # Pre-rename location; stats are migrated from here on first run so a rename
 # does not silently reset a repository's history.
 LEGACY_MEMORY_DIR = Path.home() / ".review_agent_memory"
+IMPROVEMENT_DB = Path(
+    os.getenv("REVIEW_IMPROVEMENT_DB", str(MEMORY_DIR / "improvement.db"))
+).expanduser()
 
 # --- observability --------------------------------------------------------
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY")
@@ -187,7 +191,11 @@ def enable_langsmith() -> bool:
 
 
 # --- sandbox --------------------------------------------------------------
-ALLOWED_COMMANDS = frozenset({"bandit", "semgrep"})
+# Scanner support is deliberately narrower than a generic executable allowlist.
+# Bandit is installed with the project and has a small argument surface that we
+# validate explicitly. Semgrep may be reintroduced when rules are vendored and
+# its network-capable configuration flags can be constrained safely.
+ALLOWED_COMMANDS = frozenset({"bandit"})
 COMMAND_TIMEOUT_SECONDS = 60
 
 # --- virtual filesystem layout -------------------------------------------
@@ -203,6 +211,54 @@ def resolve_profile(name: str | None = None) -> dict[str, object]:
     if key not in PROFILE_LABELS:
         key = COST_PROFILE
     return dict(COST_PROFILES[MODEL_PROVIDER][key])
+
+
+@dataclass(frozen=True)
+class ReviewSettings:
+    """Fully resolved settings for one review run.
+
+    Keeping this as one value prevents the UI, file filter, and model builder
+    from each interpreting a cost profile differently.
+    """
+
+    profile_name: str
+    orchestrator_model: str
+    subagent_model: str
+    orchestrator_effort: str
+    subagent_effort: str
+    max_tokens: int
+    review_docs: bool
+    max_cost_usd: float
+    max_llm_calls: int
+
+
+def _env_bool(name: str, fallback: bool) -> bool:
+    value = os.getenv(name)
+    return fallback if value is None else value.strip().lower() == "true"
+
+
+def resolve_review_settings(name: str | None = None) -> ReviewSettings:
+    """Resolve a profile and then apply explicit environment overrides."""
+    requested = (name or COST_PROFILE).strip().lower()
+    profile_name = requested if requested in PROFILE_LABELS else COST_PROFILE
+    spec = resolve_profile(profile_name)
+    return ReviewSettings(
+        profile_name=profile_name,
+        orchestrator_model=os.getenv(
+            "ORCHESTRATOR_MODEL", str(spec["orchestrator_model"])
+        ),
+        subagent_model=os.getenv("SUBAGENT_MODEL", str(spec["subagent_model"])),
+        orchestrator_effort=os.getenv(
+            "ORCHESTRATOR_EFFORT", str(spec["orchestrator_effort"])
+        ),
+        subagent_effort=os.getenv(
+            "SUBAGENT_EFFORT", str(spec["subagent_effort"])
+        ),
+        max_tokens=int(os.getenv("REVIEW_MAX_OUTPUT_TOKENS", str(spec["max_tokens"]))),
+        review_docs=_env_bool("REVIEW_DOCS", bool(spec["review_docs"])),
+        max_cost_usd=MAX_COST_USD,
+        max_llm_calls=MAX_LLM_CALLS,
+    )
 
 
 def anthropic_api_key() -> str:

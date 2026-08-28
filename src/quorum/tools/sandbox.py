@@ -26,8 +26,6 @@ from langchain_core.tools import BaseTool
 from quorum.config import (
     ALLOWED_COMMANDS,
     COMMAND_TIMEOUT_SECONDS,
-    FINDINGS_DIR,
-    PATCHES_DIR,
     PR_DIR,
 )
 
@@ -36,9 +34,22 @@ from quorum.config import (
 # outright so a malformed prompt cannot smuggle intent past the allowlist.
 SHELL_METACHARACTERS = set(";|&$`><\n\r\\")
 
-VFS_PREFIXES = (PR_DIR, FINDINGS_DIR, PATCHES_DIR)
-
 MAX_OUTPUT_CHARS = 8000
+
+BANDIT_BOOLEAN_FLAGS = frozenset(
+    {
+        "-l",
+        "-ll",
+        "-lll",
+        "-i",
+        "-ii",
+        "-iii",
+        "-q",
+        "--quiet",
+        "--exit-zero",
+    }
+)
+BANDIT_FORMATS = frozenset({"csv", "json", "screen", "txt", "xml", "yaml"})
 
 # Scanners are installed as project dependencies, so they live in the running
 # interpreter's bin directory — which is not on PATH when the app is launched
@@ -94,13 +105,48 @@ def validate_command(cmd: str) -> list[str]:
         raise CommandRejected(
             f"Use the bare command name, not a path: {argv[0]!r}."
         )
+    if program == "bandit":
+        _validate_bandit_args(argv[1:])
     return argv
 
 
-def _is_vfs_path(token: str) -> bool:
-    return any(
-        token == prefix or token.startswith(prefix + "/") for prefix in VFS_PREFIXES
+def _is_pr_path(token: str) -> bool:
+    candidate = PurePosixPath(token)
+    return bool(
+        token.startswith(PR_DIR + "/")
+        and token != PR_DIR + "/"
+        and "\x00" not in token
+        and all(part not in ("", ".", "..") for part in candidate.parts[1:])
     )
+
+
+def _validate_bandit_args(args: list[str]) -> None:
+    """Allow read-only Bandit scans over explicitly mounted PR files only."""
+    targets: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in BANDIT_BOOLEAN_FLAGS:
+            index += 1
+            continue
+        if token in ("-f", "--format"):
+            if index + 1 >= len(args) or args[index + 1] not in BANDIT_FORMATS:
+                raise CommandRejected(
+                    f"Bandit format must be one of: {', '.join(sorted(BANDIT_FORMATS))}."
+                )
+            index += 2
+            continue
+        if token.startswith("-"):
+            raise CommandRejected(f"Bandit option {token!r} is not allowed.")
+        if not _is_pr_path(token):
+            raise CommandRejected(
+                f"Bandit targets must be mounted files under {PR_DIR}/; got {token!r}."
+            )
+        targets.append(token)
+        index += 1
+
+    if not targets:
+        raise CommandRejected(f"Bandit requires at least one target under {PR_DIR}/.")
 
 
 def make_run_command(backend) -> BaseTool:
@@ -108,15 +154,15 @@ def make_run_command(backend) -> BaseTool:
 
     @tool
     def run_command(cmd: str) -> str:
-        """Run an allowlisted static-analysis command (bandit or semgrep).
+        """Run a constrained Bandit scan over mounted pull-request files.
 
         Virtual filesystem paths such as /pr/app.py are materialized to real
         temporary files automatically, so pass them exactly as they appear in
         the VFS. Example: `bandit -ll -f json /pr/app.py`.
 
         Args:
-            cmd: The command to run. Only `bandit` and `semgrep` are permitted;
-                no shell metacharacters, pipes, or redirection.
+            cmd: A Bandit command. Only read-only reporting flags and targets
+                under `/pr/` are permitted; no shell syntax or host paths.
 
         Returns:
             Combined stdout/stderr from the command, or an explanatory error.
@@ -131,7 +177,7 @@ def make_run_command(backend) -> BaseTool:
         with tempfile.TemporaryDirectory(prefix="review-sandbox-") as workdir:
             resolved: list[str] = []
             for token in argv:
-                if not _is_vfs_path(token):
+                if not _is_pr_path(token):
                     resolved.append(token)
                     continue
                 result = backend.read(token)
@@ -141,9 +187,12 @@ def make_run_command(backend) -> BaseTool:
                         "Mount it with write_file before running a scanner."
                     )
                 content = file_data_to_string(result.file_data)
-                # Preserve the basename so scanner output references a
-                # recognizable filename and extension-based detection works.
-                local = os.path.join(workdir, PurePosixPath(token).name)
+                # Preserve the repository-relative path so two files with the
+                # same basename cannot overwrite each other in a multi-target
+                # scan and extension-based detection still works.
+                relative = PurePosixPath(token).relative_to(PR_DIR)
+                local = os.path.join(workdir, *relative.parts)
+                os.makedirs(os.path.dirname(local), exist_ok=True)
                 with open(local, "w", encoding="utf-8") as handle:
                     handle.write(content)
                 resolved.append(local)

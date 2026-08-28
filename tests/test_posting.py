@@ -8,7 +8,13 @@ import pytest
 
 from quorum.models import ReviewComment
 from quorum.tools.github_tools import (
+    ChangedFile,
+    StaleReviewError,
     added_lines_by_path,
+    is_safe_repo_path,
+    load_changed_files,
+    make_pr_tools,
+    post_approved_review,
     re_anchor,
     should_skip,
 )
@@ -112,6 +118,86 @@ class TestAddedLines:
         assert "app.py" not in added
 
 
+class TestPostingBoundary:
+    @staticmethod
+    def _context():
+        from quorum.models import ReviewContext
+
+        return ReviewContext(
+            owner="acme", repo="widgets", pr_number=42, title="T", body="",
+            head_sha="abc123", base_sha="def456", author="dev",
+        )
+
+    @staticmethod
+    def _client(monkeypatch, *, head="abc123"):
+        import quorum.tools.github_tools as github_tools
+
+        item = SimpleNamespace(
+            filename="app.py", previous_filename=None, patch=PATCH,
+        )
+
+        class Pull:
+            def __init__(self):
+                self.head = SimpleNamespace(sha=head)
+                self.reviews = []
+
+            def get_files(self):
+                return [item]
+
+            def create_review(self, **kwargs):
+                self.reviews.append(kwargs)
+                return SimpleNamespace(html_url="https://example.test/review/1")
+
+        pull = Pull()
+
+        class Repo:
+            def get_pull(self, _number):
+                return pull
+
+            def get_contents(self, _path, ref):
+                assert ref == "abc123"
+                return SimpleNamespace(
+                    decoded_content=(
+                        "import os\nimport sys\n\ndef connect():\n"
+                        "    password = \"hunter2\"\n    return password\n"
+                    ).encode()
+                )
+
+            def get_commit(self, sha):
+                return SimpleNamespace(sha=sha)
+
+        repo = Repo()
+        client = SimpleNamespace(get_repo=lambda _full: repo)
+        monkeypatch.setattr(github_tools, "_client", lambda: client)
+        return pull
+
+    def test_missing_anchor_is_rejected_even_on_an_added_line(self, monkeypatch):
+        pull = self._client(monkeypatch)
+        comment = make_comment(line=5, anchor_text="line that is not in the file")
+
+        result = post_approved_review(self._context(), [comment])
+
+        assert result.posted == 0
+        assert result.dropped_invalid_anchor
+        assert pull.reviews == []
+
+    def test_stale_review_head_aborts_before_posting(self, monkeypatch):
+        self._client(monkeypatch, head="new456")
+
+        with pytest.raises(StaleReviewError, match="changed from reviewed head"):
+            post_approved_review(self._context(), [make_comment(line=5)])
+
+    def test_valid_comment_posts_once_at_the_reviewed_head(self, monkeypatch):
+        pull = self._client(monkeypatch)
+
+        result = post_approved_review(self._context(), [make_comment(line=5)])
+
+        assert result.posted == 1
+        assert result.posted_locations == ["app.py:5"]
+        assert len(pull.reviews) == 1
+        assert pull.reviews[0]["comments"][0]["line"] == 5
+
+
 class TestSkipFilter:
     @pytest.mark.parametrize(
         "path",
@@ -132,6 +218,82 @@ class TestSkipFilter:
     )
     def test_real_source_is_reviewed(self, path):
         assert not should_skip(path)
+
+
+class TestScopedGitHubTools:
+    def test_tools_are_bound_to_one_manifest(self):
+        from quorum.models import ReviewContext
+
+        context = ReviewContext(
+            owner="acme", repo="widgets", pr_number=7, title="Title", body="Body",
+            head_sha="abc123", base_sha="def456", author="dev",
+        )
+        files = [
+            ChangedFile(
+                path="src/app.py", status="modified", additions=2, deletions=1,
+                patch="@@ -1 +1 @@", content="print('frozen')\n",
+            )
+        ]
+        tools = {tool.name: tool for tool in make_pr_tools(context, files, [])}
+
+        assert tools["fetch_pr"].args_schema.model_json_schema()["properties"] == {}
+        assert tools["list_files"].args_schema.model_json_schema()["properties"] == {}
+        schema = tools["get_file_content"].args_schema.model_json_schema()
+        assert set(schema["properties"]) == {"path"}
+        assert "REJECTED" in tools["get_file_content"].invoke({"path": "other/private.py"})
+        assert tools["get_file_content"].invoke({"path": "src/app.py"}) == "print('frozen')\n"
+        assert "src/app.py" in tools["list_files"].invoke({})
+
+    def test_changed_file_content_is_frozen_at_the_context_head(
+        self, monkeypatch
+    ):
+        import quorum.tools.github_tools as github_tools
+        from quorum.models import ReviewContext
+
+        context = ReviewContext(
+            owner="acme", repo="widgets", pr_number=7, title="Title", body="Body",
+            head_sha="abc123", base_sha="def456", author="dev",
+        )
+        item = SimpleNamespace(
+            filename="src/app.py", status="modified", additions=1, deletions=0,
+            patch="@@ -0,0 +1 @@\n+print('frozen')", previous_filename=None,
+        )
+        pull = SimpleNamespace(
+            head=SimpleNamespace(sha="abc123"), get_files=lambda: [item]
+        )
+
+        class Repo:
+            def get_pull(self, number):
+                assert number == 7
+                return pull
+
+            def get_contents(self, path, ref):
+                assert (path, ref) == ("src/app.py", "abc123")
+                return SimpleNamespace(decoded_content=b"print('frozen')\n")
+
+        monkeypatch.setattr(
+            github_tools,
+            "_client",
+            lambda: SimpleNamespace(get_repo=lambda _full: Repo()),
+        )
+
+        files, skipped = load_changed_files(context)
+
+        assert skipped == []
+        assert files[0].content == "print('frozen')\n"
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("src/app.py", True),
+            ("tests/unit/app.py", True),
+            ("/etc/passwd", False),
+            ("../secret.py", False),
+            ("src/../secret.py", False),
+        ],
+    )
+    def test_repository_path_safety(self, path, expected):
+        assert is_safe_repo_path(path) is expected
 
 
 class TestFormatting:

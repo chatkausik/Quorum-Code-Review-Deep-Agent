@@ -389,6 +389,7 @@ PHASES = [
     ("mount", "Mount"),
     ("review", "Review"),
     ("consolidate", "Consolidate"),
+    ("health", "Validate"),
 ]
 
 
@@ -435,7 +436,7 @@ def model_table(by_model: dict) -> str:
     if not by_model:
         return ""
     rows = "".join(
-        f"<tr><td>{name}</td><td>{v['calls']}</td>"
+        f"<tr><td>{html.escape(str(name))}</td><td>{v['calls']}</td>"
         f"<td>{v['input']:,}</td><td>{v['output']:,}</td>"
         f"<td>${v['cost']:.4f}</td></tr>"
         for name, v in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"])

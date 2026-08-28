@@ -10,35 +10,32 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from collections import Counter
 from collections.abc import Callable
-from pathlib import PurePosixPath
 from typing import Any
 
 from deepagents import create_deep_agent
-from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+from deepagents.backends import CompositeBackend
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.language_models import BaseChatModel
 from pydantic import ValidationError
 
+from quorum.backends import ReadOnlyFilesystemBackend, ReviewStateBackend
 from quorum.config import (
     CONFIDENCE_THRESHOLD,
     MAX_OUTPUT_TOKENS,
     MODEL_PROVIDER,
-    ORCHESTRATOR_EFFORT,
-    SUBAGENT_EFFORT,
-    enable_langsmith,
     provider_api_key,
-    resolve_profile,
+    resolve_review_settings,
     FINAL_MARKER,
     FINDINGS_DIR,
-    MAX_COST_USD,
-    MAX_LLM_CALLS,
-    ORCHESTRATOR_MODEL,
     SKILLS_DIR,
     SKILLS_MOUNT,
-    SUBAGENT_MODEL,
+    ReviewSettings,
 )
+from quorum.evaluation import evaluate_run_health
+from quorum.improvement import ImprovementStore
 from quorum.memory import FileBackedStore
 from quorum.middleware import (
     BudgetExceeded,
@@ -53,12 +50,11 @@ from quorum.prompts import (
     PYTHON_REVIEWER_PROMPT,
 )
 from quorum.tools.github_tools import (
-    fetch_pr,
-    get_file_content,
-    list_files,
+    ChangedFile,
+    load_changed_files,
     load_pr_context,
+    make_pr_tools,
 )
-from quorum.tools.memory_tools import read_review_memory, write_review_memory
 from quorum.tools.sandbox import make_run_command
 from quorum.tools.search_tools import regex_search
 
@@ -92,10 +88,19 @@ def _model(name: str, effort: str, max_tokens: int = MAX_OUTPUT_TOKENS) -> BaseC
 
     from langchain_anthropic import ChatAnthropic
 
+    common = {
+        "model": name,
+        "api_key": provider_api_key(),
+        "max_tokens": max_tokens,
+    }
+    if name.startswith("claude-haiku-4-5"):
+        # Haiku 4.5 does not support adaptive or interleaved thinking. For the
+        # inexpensive file-review subagents, omit thinking controls entirely
+        # so normal tool use does not pay a fixed reasoning-token budget.
+        return ChatAnthropic(**common)
+
     return ChatAnthropic(
-        model=name,
-        api_key=provider_api_key(),
-        max_tokens=max_tokens,
+        **common,
         thinking={"type": "adaptive"},
         output_config={"effort": effort},
     )
@@ -104,13 +109,17 @@ def _model(name: str, effort: str, max_tokens: int = MAX_OUTPUT_TOKENS) -> BaseC
 def build_backend() -> CompositeBackend:
     """VFS for run artifacts, real disk for skills.
 
-    /pr, /findings and /patches live in agent state, so the host filesystem is
-    never touched by a review. /skills is mounted read-only from the repo so a
-    security team can edit a pattern without a redeploy.
+    /pr, /findings and /patches live in agent state, so reviewed source is not
+    written to the host filesystem. /skills is mounted read-only from the repo
+    so a security team can edit a pattern without a redeploy.
     """
     return CompositeBackend(
-        default=StateBackend(),
-        routes={f"{SKILLS_MOUNT}/": FilesystemBackend(root_dir=str(SKILLS_DIR))},
+        default=ReviewStateBackend(),
+        routes={
+            f"{SKILLS_MOUNT}/": ReadOnlyFilesystemBackend(
+                root_dir=str(SKILLS_DIR)
+            )
+        },
     )
 
 
@@ -134,23 +143,28 @@ def all_skill_paths() -> list[str]:
 def build_agent(
     context: ReviewContext,
     store: FileBackedStore,
-    profile: str | None = None,
+    changed_files: list[ChangedFile],
+    skipped_files: list[str],
+    settings: ReviewSettings,
 ):
     """Assemble the orchestrator, its subagents, and the shared cost ceiling."""
-    spec = resolve_profile(profile)
-    orchestrator_model = str(spec["orchestrator_model"])
-    subagent_model = str(spec["subagent_model"])
-    orchestrator_effort = str(spec["orchestrator_effort"])
-    subagent_effort = str(spec["subagent_effort"])
-    max_tokens = int(spec["max_tokens"])
+    orchestrator_model = settings.orchestrator_model
+    subagent_model = settings.subagent_model
+    orchestrator_effort = settings.orchestrator_effort
+    subagent_effort = settings.subagent_effort
+    max_tokens = settings.max_tokens
 
     backend = build_backend()
     run_command = make_run_command(backend)
 
     # One shared instance: subagents are separately compiled graphs, so a
     # ceiling attached only to the orchestrator would not bound the run.
-    cost = CostTrackingMiddleware(max_cost_usd=MAX_COST_USD, max_calls=MAX_LLM_CALLS)
+    cost = CostTrackingMiddleware(
+        max_cost_usd=settings.max_cost_usd,
+        max_calls=settings.max_llm_calls,
+    )
     pr_metadata = PRMetadataMiddleware(context)
+    pr_tools = make_pr_tools(context, changed_files, skipped_files)
 
     python_reviewer = {
         "name": "python_reviewer",
@@ -183,13 +197,9 @@ def build_agent(
     agent = create_deep_agent(
         model=_model(orchestrator_model, orchestrator_effort, max_tokens),
         tools=[
-            fetch_pr,
-            list_files,
-            get_file_content,
+            *pr_tools,
             regex_search,
             run_command,
-            read_review_memory,
-            write_review_memory,
         ],
         system_prompt=ORCHESTRATOR_PROMPT,
         subagents=[python_reviewer, generic_reviewer],
@@ -382,6 +392,24 @@ def parse_findings_files(
     return collected
 
 
+def merge_findings(
+    comments: list[ReviewComment], dropped: Counter | None = None
+) -> list[ReviewComment]:
+    """Deduplicate deterministically, retaining the strongest finding per line."""
+    counter = dropped if dropped is not None else Counter()
+    winners: dict[tuple[str, int], ReviewComment] = {}
+    for comment in comments:
+        key = (comment.path, comment.line)
+        current = winners.get(key)
+        if current is None:
+            winners[key] = comment
+            continue
+        counter["duplicate"] += 1
+        if comment.sort_key() < current.sort_key():
+            winners[key] = comment
+    return list(winners.values())
+
+
 def _final_text(result: dict[str, Any]) -> str:
     messages = result.get("messages") or []
     for message in reversed(messages):
@@ -465,25 +493,17 @@ def _describe_update(node: str, update: Any) -> list[dict[str, str]]:
             elif name == "write_file":
                 path = str(args.get("file_path", ""))
                 if path.startswith(FINDINGS_DIR):
-                    add("consolidate", "📋", "Subagent wrote findings", path)
-                elif path.startswith("/pr/"):
-                    add("mount", "📂", "Mounted file", path)
-                elif path.startswith("/patches/"):
-                    add("mount", "🧩", "Stored patch", path)
+                    add("review", "📋", "Reviewer wrote its result", path)
             elif name == "get_file_content":
-                add("fetch", "⬇️", "Fetching file", str(args.get("path", "")))
+                add("fetch", "⬇️", "Reading frozen file", str(args.get("path", "")))
             elif name == "list_files":
-                add("fetch", "📄", "Listing changed files", "")
+                add("fetch", "📄", "Reading frozen manifest", "")
             elif name == "fetch_pr":
-                add("fetch", "🔗", "Fetching PR metadata", "")
+                add("fetch", "🔗", "Reading frozen PR metadata", "")
             elif name == "run_command":
                 add("review", "🛡️", "Running scanner", str(args.get("cmd", ""))[:80])
             elif name == "regex_search":
                 add("review", "🔎", "Pattern scan", str(args.get("pattern", ""))[:60])
-            elif name == "read_review_memory":
-                add("memory", "🧠", "Reading long-term memory", "")
-            elif name == "write_review_memory":
-                add("memory", "💾", "Updating long-term memory", "")
             elif name == "write_todos":
                 add("plan", "🗂️", "Planning the run", "")
             elif name in ("ls", "read_file"):
@@ -510,6 +530,25 @@ def _count_subagent_findings(state: dict[str, Any]) -> int:
     return total
 
 
+def _reviewed_paths(state: dict[str, Any], expected_paths: set[str]) -> set[str]:
+    """Repository paths with a per-file findings artifact, including empty ones."""
+    files = state.get("files") or {}
+    reviewed: set[str] = set()
+    for path in expected_paths:
+        data = files.get(f"{FINDINGS_DIR}/{path}.json")
+        content = data.get("content") if isinstance(data, dict) else data
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        items = payload.get("comments") if isinstance(payload, dict) else payload
+        if isinstance(items, list):
+            reviewed.add(path)
+    return reviewed
+
+
 def _recover_state(agent, run_config: dict[str, Any]) -> dict[str, Any]:
     """Read the last checkpoint after a failed run.
 
@@ -529,6 +568,7 @@ def run_review(
     repo: str,
     pr_number: int,
     store: FileBackedStore | None = None,
+    improvement_store: ImprovementStore | None = None,
     profile: str | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> ReviewResult:
@@ -538,14 +578,63 @@ def run_review(
     authority belongs to the human at the UI.
     """
     store = store or FileBackedStore()
+    improvement_store = improvement_store or ImprovementStore()
+    settings = resolve_review_settings(profile)
     context = load_pr_context(owner, repo, pr_number)
-    agent, cost = build_agent(context, store, profile)
+    changed_files, skipped_files = load_changed_files(
+        context, review_docs=settings.review_docs
+    )
+    expected_paths = {item.path for item in changed_files}
+    expected_content = {item.path: item.content for item in changed_files}
+    run_id = f"review-{uuid.uuid4().hex[:16]}"
+    history = store.get_stats(owner, repo)
+
+    if not changed_files:
+        state: dict[str, Any] = {"files": {}}
+        health_checks = evaluate_run_health(
+            expected_paths=set(),
+            comments=[],
+            state=state,
+            error=None,
+            budget_exceeded=False,
+            total_cost_usd=0.0,
+            llm_calls=0,
+            max_cost_usd=settings.max_cost_usd,
+            max_llm_calls=settings.max_llm_calls,
+        )
+        result = ReviewResult(
+            comments=[],
+            context=context,
+            total_cost_usd=0.0,
+            llm_calls=0,
+            trace=[
+                "No eligible changed files; the model was not called.",
+                *[f"skipped: {path}" for path in skipped_files],
+            ],
+            files_reviewed=0,
+            run_id=run_id,
+            profile=settings.profile_name,
+            expected_files=0,
+            health_checks=health_checks,
+        )
+        store.record_run(owner, repo)
+        try:
+            improvement_store.record_review(result)
+        except Exception:  # noqa: BLE001 - feedback persistence is best effort
+            logger.exception("Could not persist improvement-loop data for %s", run_id)
+        return result
+
+    agent, cost = build_agent(
+        context, store, changed_files, skipped_files, settings
+    )
 
     task = (
         f"Review pull request #{pr_number} in {owner}/{repo}. "
-        f"The head SHA is {context.head_sha} — mount every changed file at that "
-        f"ref. Follow your run plan exactly and finish with the "
-        f"{FINAL_MARKER} marker."
+        f"The head SHA is {context.head_sha}. Inspect every changed file already "
+        f"preloaded at that ref. Follow your run plan exactly and finish with the "
+        f"{FINAL_MARKER} marker. Historical counters (trusted, informational "
+        f"only): total_runs={int(history.get('total_runs', 0))}, "
+        f"total_comments_posted={int(history.get('total_comments_posted', 0))}."
     )
 
     budget_exceeded = False
@@ -553,7 +642,20 @@ def run_review(
     state: dict[str, Any] = {}
     run_config = {
         "recursion_limit": RECURSION_LIMIT,
-        "configurable": {"thread_id": f"{owner}/{repo}#{pr_number}"},
+        "configurable": {"thread_id": run_id},
+    }
+    initial_files = {
+        **{
+            f"/pr/{item.path}": {"content": item.content, "encoding": "utf-8"}
+            for item in changed_files
+        },
+        **{
+            f"/patches/{item.path}.patch": {
+                "content": item.patch,
+                "encoding": "utf-8",
+            }
+            for item in changed_files
+        },
     }
 
     def emit(event: dict[str, Any]) -> None:
@@ -569,12 +671,42 @@ def run_review(
             emit({"type": "log", "phase": "plan", "icon": "🚀",
                   "text": f"Starting review of {context.full_repo}#{pr_number}",
                   "detail": context.title[:110]})
+            emit({
+                "type": "log",
+                "phase": "memory",
+                "icon": "🧠",
+                "text": "Loaded trusted historical counters",
+                "detail": (
+                    f"{int(history.get('total_runs', 0))} prior run(s) · "
+                    f"{int(history.get('total_comments_posted', 0))} posted comment(s)"
+                ),
+            })
+            emit({
+                "type": "log",
+                "phase": "fetch",
+                "icon": "🔒",
+                "text": "Froze pull-request target and manifest",
+                "detail": (
+                    f"head {context.head_sha[:7]} · {len(changed_files)} eligible · "
+                    f"{len(skipped_files)} skipped"
+                ),
+            })
+            emit({
+                "type": "log",
+                "phase": "mount",
+                "icon": "📦",
+                "text": "Preloaded immutable review evidence",
+                "detail": f"{len(changed_files)} source file(s) and patch(es)",
+            })
             # "values" carries the accumulated state on every step, so the
             # final findings are captured as they stream. Relying only on a
             # post-hoc checkpoint read made a failed read look identical to a
             # run that genuinely found nothing.
             for mode, chunk in agent.stream(
-                {"messages": [{"role": "user", "content": task}]},
+                {
+                    "messages": [{"role": "user", "content": task}],
+                    "files": initial_files,
+                },
                 config=run_config,
                 stream_mode=["updates", "values"],
             ):
@@ -609,18 +741,41 @@ def run_review(
     # slip can no longer silently lose a real issue. Low severity and
     # duplicates are still filtered by _coerce.
     dropped: Counter = Counter()
-    seen: set[tuple[str, int]] = set()
-    comments = parse_marker_output(_final_text(state), dropped, seen) if state else []
-    recovered = (
-        parse_findings_files(state.get("files", {}), dropped, seen) if state else []
+    marker_comments = (
+        parse_marker_output(_final_text(state), dropped, set()) if state else []
     )
-    if recovered:
+    file_comments = (
+        parse_findings_files(state.get("files", {}), dropped, set()) if state else []
+    )
+
+    scoped_comments: list[ReviewComment] = []
+    for comment in marker_comments + file_comments:
+        if comment.path not in expected_paths:
+            dropped["out-of-scope path"] += 1
+            continue
+        scoped_comments.append(comment)
+    comments = merge_findings(scoped_comments, dropped)
+
+    marker_keys = {(comment.path, comment.line) for comment in marker_comments}
+    recovered_count = sum(
+        1 for comment in file_comments if (comment.path, comment.line) not in marker_keys
+    )
+    if recovered_count:
         logger.info(
-            "Recovered %d finding(s) the consolidation step omitted", len(recovered)
+            "Recovered %d finding(s) the consolidation step omitted", recovered_count
         )
-    comments = comments + recovered
 
     comments.sort(key=lambda c: c.sort_key())
+    emit({
+        "type": "log",
+        "phase": "consolidate",
+        "icon": "🧾",
+        "text": "Consolidated candidate findings",
+        "detail": (
+            f"{len(comments)} retained · {sum(dropped.values())} filtered · "
+            f"{recovered_count} recovered"
+        ),
+    })
 
     if not state and error is None:
         error = (
@@ -630,9 +785,29 @@ def run_review(
         )
         logger.error("Empty final state after a successful stream")
 
-    store.record_run(owner, repo)
+    files_reviewed = len(_reviewed_paths(state, expected_paths))
+    health_checks = evaluate_run_health(
+        expected_paths=expected_paths,
+        expected_content=expected_content,
+        comments=comments,
+        state=state,
+        error=error,
+        budget_exceeded=budget_exceeded,
+        total_cost_usd=cost.total_cost_usd,
+        llm_calls=cost.calls,
+        max_cost_usd=settings.max_cost_usd,
+        max_llm_calls=settings.max_llm_calls,
+    )
+    failed_health = sum(1 for check in health_checks if not check.passed)
+    emit({
+        "type": "log",
+        "phase": "health",
+        "icon": "✅" if not failed_health else "⚠️",
+        "text": "Evaluated deterministic health contract",
+        "detail": f"{len(health_checks) - failed_health}/{len(health_checks)} checks passed",
+    })
 
-    return ReviewResult(
+    result = ReviewResult(
         comments=comments,
         context=context,
         total_cost_usd=cost.total_cost_usd,
@@ -644,11 +819,19 @@ def run_review(
         subagent_reported=_count_subagent_findings(state) if state else 0,
         trace_url=trace.get("url"),
         project_url=project_url(),
-        recovered_from_files=len(recovered),
-        files_reviewed=sum(
-            1 for path in (state.get("files") or {}) if path.startswith("/pr/")
-        ),
+        recovered_from_files=recovered_count,
+        files_reviewed=files_reviewed,
+        run_id=run_id,
+        profile=settings.profile_name,
+        expected_files=len(expected_paths),
+        health_checks=health_checks,
     )
+    store.record_run(owner, repo)
+    try:
+        improvement_store.record_review(result)
+    except Exception:  # noqa: BLE001 - feedback persistence must not lose findings
+        logger.exception("Could not persist improvement-loop data for %s", run_id)
+    return result
 
 
 def bucket_by_confidence(

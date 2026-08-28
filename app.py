@@ -7,6 +7,7 @@ reading them.
 
 from __future__ import annotations
 
+import html
 import sys
 from collections import Counter
 from pathlib import Path
@@ -19,13 +20,14 @@ from quorum.agent import bucket_by_confidence, run_review
 from quorum.config import (
     CONFIDENCE_THRESHOLD,
     COST_PROFILE,
-    COST_PROFILES,
     MAX_COST_USD,
     MAX_LLM_CALLS,
     MODEL_PROVIDER,
     PROFILE_LABELS,
     langsmith_enabled,
+    resolve_review_settings,
 )
+from quorum.improvement import ImprovementStore
 from quorum.memory import FileBackedStore
 from quorum.models import SEVERITY_ORDER, ReviewComment
 from quorum.observability import project_url
@@ -137,7 +139,7 @@ def _finding_body(comment: ReviewComment, context) -> None:
     lines = file_lines(context.full_repo, comment.path, context.head_sha)
 
     st.markdown(
-        f'<div class="cra-modal-sub">{comment.path}:{comment.line}</div>',
+        f'<div class="cra-modal-sub">{html.escape(comment.path)}:{comment.line}</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -172,7 +174,7 @@ def finding_dialog(comment: ReviewComment, threshold: int, context, gated: bool)
         f'1px solid rgba(140,150,170,.2)">'
         f'<span class="cra-badge" style="background:{style["color"]}">'
         f'{style["label"]}</span>'
-        f'<span class="cra-path">{comment.summary(90)}</span>'
+        f'<span class="cra-path">{html.escape(comment.summary(90))}</span>'
         f'<span class="cra-cat">{meta["icon"]} {meta["label"]}</span>'
         f'<span class="cra-conf">confidence'
         f'<span class="cra-bar"><span style="width:{comment.confidence}%;'
@@ -249,6 +251,83 @@ def approved_comments(comments: list[ReviewComment]) -> list[ReviewComment]:
     ]
 
 
+ISSUE_STATUSES = ["open", "muted", "fixed"]
+ISSUE_STATUS_LABELS = {"open": "Open", "muted": "Muted", "fixed": "Fixed"}
+ISSUE_EMPTY_TEXT = {
+    "open": "No recurring health-contract failures are open for this repository.",
+    "muted": "Nothing is muted. Muted invariants stay muted even when they recur.",
+    "fixed": "Nothing is marked fixed. A fixed invariant reopens if it recurs.",
+}
+# Every status offers a route back, so muting an invariant is never a dead end.
+ISSUE_ACTIONS = {
+    "open": [("Mute", "muted"), ("Mark fixed", "fixed")],
+    "muted": [("Unmute", "open"), ("Mark fixed", "fixed")],
+    "fixed": [("Reopen", "open"), ("Mute", "muted")],
+}
+
+
+def render_improvement_panel(result) -> None:
+    """Show deterministic run health and durable improvement signals."""
+    store: ImprovementStore = st.session_state.improvement_store
+    summary = store.summary(result.context.full_repo)
+    passed = sum(1 for check in result.health_checks if check.passed)
+    total = len(result.health_checks)
+
+    cols = st.columns(4)
+    cols[0].metric("Health checks", f"{passed}/{total}")
+    cols[1].metric("Recorded runs", summary.get("runs", 0))
+    cols[2].metric("Eval cases", summary.get("evaluation_cases", 0))
+    cols[3].metric("Posted signals", summary.get("posted", 0))
+
+    st.markdown("#### Run health contract")
+    for check in result.health_checks:
+        icon = "✅" if check.passed else "❌"
+        with st.expander(f"{icon} {check.name} · {check.severity}"):
+            st.write(check.detail)
+            if check.evidence:
+                st.json(check.evidence)
+
+    counts = {
+        status: len(store.list_issues(result.context.full_repo, status=status))
+        for status in ISSUE_STATUSES
+    }
+    status = st.radio(
+        "Improvement issues",
+        ISSUE_STATUSES,
+        format_func=lambda value: f"{ISSUE_STATUS_LABELS[value]} · {counts[value]}",
+        horizontal=True,
+        key="improve-status",
+        label_visibility="collapsed",
+    )
+    issues = store.list_issues(result.context.full_repo, status=status)
+    st.markdown(f"#### {ISSUE_STATUS_LABELS[status]} improvement issues · {len(issues)}")
+    if not issues:
+        st.success(ISSUE_EMPTY_TEXT[status])
+        return
+
+    for issue in issues:
+        with st.container(border=True):
+            st.markdown(
+                f"**{issue['invariant']}** · {issue['severity']} · "
+                f"{issue['occurrences']} occurrence(s)"
+            )
+            st.write(issue["summary"])
+            st.caption(f"Last seen {issue['last_seen']} · run {issue['latest_run_id']}")
+            if issue["evidence"]:
+                with st.expander("Evidence"):
+                    st.json(issue["evidence"])
+            actions = ISSUE_ACTIONS[status]
+            cols = st.columns([1, 1, 4])
+            for index, (label, target) in enumerate(actions):
+                if cols[index].button(
+                    label,
+                    key=f"improve-{target}::{issue['fingerprint']}",
+                    use_container_width=True,
+                ):
+                    store.set_issue_status(issue["fingerprint"], target)
+                    st.rerun()
+
+
 # --------------------------------------------------------------------------
 # Sidebar
 # --------------------------------------------------------------------------
@@ -277,18 +356,24 @@ with st.sidebar:
     )
     st.caption(PROFILE_LABELS[profile])
 
-    spec = COST_PROFILES[MODEL_PROVIDER][profile]
+    settings = resolve_review_settings(profile)
     st.caption(
-        f"`{spec['orchestrator_model']}` ({spec['orchestrator_effort']}) "
-        f"orchestrator · `{spec['subagent_model']}` ({spec['subagent_effort']}) "
+        f"`{settings.orchestrator_model}` ({settings.orchestrator_effort}) "
+        f"orchestrator · `{settings.subagent_model}` ({settings.subagent_effort}) "
         f"subagents"
     )
 
     run_clicked = st.button("▶  Run Review", type="primary", use_container_width=True)
-    st.caption(f"Ceiling ${MAX_COST_USD:.2f} · {MAX_LLM_CALLS} calls · docs skipped")
+    docs_label = "docs reviewed" if settings.review_docs else "docs skipped"
+    st.caption(
+        f"Ceiling ${settings.max_cost_usd:.2f} · "
+        f"{settings.max_llm_calls} calls · {docs_label}"
+    )
 
     if "store" not in st.session_state:
         st.session_state.store = FileBackedStore()
+    if "improvement_store" not in st.session_state:
+        st.session_state.improvement_store = ImprovementStore()
 
     st.divider()
     if langsmith_enabled():
@@ -325,6 +410,7 @@ if run_clicked:
         for key in [k for k in st.session_state if k.startswith("approve::")]:
             del st.session_state[key]
         st.session_state.pop("post_result", None)
+        st.session_state.pop("post_complete_run", None)
         st.session_state.pop("result", None)
 
         events: list[dict] = []
@@ -371,6 +457,7 @@ if run_clicked:
                     repo,
                     int(pr_number),
                     store=st.session_state.store,
+                    improvement_store=st.session_state.improvement_store,
                     profile=profile,
                     on_event=on_event,
                 )
@@ -420,7 +507,10 @@ else:
         if result.trace_url:
             links.append(f'<a href="{result.trace_url}" target="_blank">This run\'s trace ↗</a>')
         if result.project_url:
-            links.append(f'<a href="{result.project_url}" target="_blank">Project dashboard ↗</a>')
+            links.append(
+                f'<a href="{result.project_url}" target="_blank">'
+                "Project dashboard ↗</a>"
+            )
         st.markdown(
             '<div class="cra-obs">🔬 <b>LangSmith</b>' + " · ".join(links) + "</div>",
             unsafe_allow_html=True,
@@ -448,8 +538,12 @@ else:
 
     auto, manual = bucket_by_confidence(result.comments, int(threshold))
 
-    tab_auto, tab_manual = st.tabs(
-        [f"✅  Auto-approved · {len(auto)}", f"⚠️  Needs review · {len(manual)}"]
+    tab_auto, tab_manual, tab_improve = st.tabs(
+        [
+            f"✅  Auto-approved · {len(auto)}",
+            f"⚠️  Needs review · {len(manual)}",
+            "📈  Improve",
+        ]
     )
     with tab_auto:
         st.caption(f"Confidence ≥ {int(threshold)} — pre-selected for posting.")
@@ -475,28 +569,109 @@ else:
                 manual, int(threshold), result.context, gated=True, slot="manual"
             )
 
+    with tab_improve:
+        st.caption(
+            "Deterministic invariants and human decisions become durable "
+            "evaluation signals; source code is not stored here."
+        )
+        render_improvement_panel(result)
+
     st.divider()
     selected = approved_comments(result.comments)
+    selected_ids = {finding_key(comment) for comment in selected}
+    unselected = [
+        comment for comment in result.comments if finding_key(comment) not in selected_ids
+    ]
+    rejection_reason = None
+    if unselected:
+        rejection_reason = st.selectbox(
+            "Reason for unselected findings",
+            [
+                "not specified",
+                "false positive",
+                "duplicate",
+                "not actionable",
+                "wrong severity",
+                "wrong location",
+            ],
+            help=(
+                "Saved as evaluation feedback when you post the selected subset. "
+                "One reason applies to all currently unselected findings."
+            ),
+        )
+    already_posted = st.session_state.get("post_complete_run") == result.run_id
     left, right = st.columns([2, 1])
 
     with left:
         st.markdown(f"**{len(selected)}** comment(s) selected for posting.")
+        if already_posted:
+            st.caption(
+                "This reviewed head has already been submitted; run a new "
+                "review to post again."
+            )
+        if st.button(
+            "💾  Save Approval Feedback",
+            disabled=already_posted,
+            use_container_width=True,
+            help=(
+                "Record approved and rejected decisions without posting. This also "
+                "works when every finding is rejected."
+            ),
+        ):
+            try:
+                st.session_state.improvement_store.record_decisions(
+                    result,
+                    selected,
+                    rejection_reason=(
+                        None
+                        if rejection_reason in (None, "not specified")
+                        else rejection_reason
+                    ),
+                )
+                st.success("Approval feedback saved as evaluation data.")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Saving feedback failed — {type(exc).__name__}: {exc}")
         if st.button(
             "🚀  Post Approved Comments",
             type="primary",
-            disabled=not selected,
+            disabled=not selected or already_posted,
             use_container_width=True,
         ):
             with st.spinner("Validating line numbers and posting …"):
                 try:
+                    try:
+                        st.session_state.improvement_store.record_decisions(
+                            result,
+                            selected,
+                            rejection_reason=(
+                                None
+                                if rejection_reason in (None, "not specified")
+                                else rejection_reason
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.warning(
+                            "The review can still post, but feedback persistence failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
                     st.session_state.post_result = post_approved_review(
                         result.context, selected
                     )
+                    try:
+                        st.session_state.improvement_store.record_post_result(
+                            result, selected, st.session_state.post_result
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.warning(
+                            "Comments were validated, but the post outcome was not "
+                            f"saved as feedback: {type(exc).__name__}: {exc}"
+                        )
                     st.session_state.store.record_posted(
                         result.context.owner,
                         result.context.repo,
                         st.session_state.post_result.posted,
                     )
+                    st.session_state.post_complete_run = result.run_id
                 except PermissionError as exc:
                     st.error(str(exc))
                 except Exception as exc:  # noqa: BLE001
@@ -531,6 +706,12 @@ else:
                 f"Dropped {len(posted.dropped_off_diff)} comment(s) off the diff"
             ):
                 for entry in posted.dropped_off_diff:
+                    st.text(entry)
+        if posted.dropped_invalid_anchor:
+            with st.expander(
+                f"Dropped {len(posted.dropped_invalid_anchor)} comment(s) with invalid anchors"
+            ):
+                for entry in posted.dropped_invalid_anchor:
                     st.text(entry)
 
     if result.trace:

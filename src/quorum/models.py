@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -61,6 +61,16 @@ class ReviewComment(BaseModel):
         return "".join(parts)
 
 
+class HealthCheck(BaseModel):
+    """One deterministic invariant evaluated for a review run."""
+
+    name: str
+    severity: Severity
+    passed: bool
+    detail: str
+    evidence: dict[str, object] = Field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class ReviewContext:
     """Runtime context passed into the graph, read by PRMetadataMiddleware.
@@ -103,12 +113,18 @@ class ReviewResult:
     files_reviewed: int = 0
     # Findings the consolidation step omitted, recovered from /findings.
     recovered_from_files: int = 0
+    run_id: str = ""
+    profile: str = ""
+    expected_files: int = 0
+    health_checks: list[HealthCheck] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.trace is None:
             self.trace = []
         if self.dropped is None:
             self.dropped = {}
+        if self.health_checks is None:
+            self.health_checks = []
 
     def drop_summary(self) -> str:
         """Human-readable account of filtered findings, empty when none."""
@@ -126,3 +142,5 @@ class PostResult:
     dropped_off_diff: list[str]
     re_anchored: list[str]
     review_url: str | None = None
+    dropped_invalid_anchor: list[str] = field(default_factory=list)
+    posted_locations: list[str] = field(default_factory=list)

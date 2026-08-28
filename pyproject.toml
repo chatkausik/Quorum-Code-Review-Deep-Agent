@@ -9,13 +9,15 @@ description = "Quorum — a deep-agents orchestrator that reviews GitHub pull re
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "deepagents>=0.4.11",
+  "deepagents>=0.7.9,<0.8",
+  "langchain-openai>=1.6,<2",
   "langchain-anthropic>=1.6.1",
   "PyGithub>=2.5",
   "unidiff>=0.7.5",
   "streamlit>=1.40",
   "python-dotenv>=1.0",
   "bandit>=1.8",
+  "regex>=2024.11",
 ]
 
 [project.optional-dependencies]

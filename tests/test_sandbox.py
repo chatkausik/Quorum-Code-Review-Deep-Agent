@@ -53,17 +53,34 @@ class TestRejected:
         with pytest.raises(CommandRejected):
             validate_command("bandit 'unclosed")
 
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "bandit -r /etc",
+            "bandit -o /tmp/report /pr/app.py",
+            "bandit -c /tmp/config.yml /pr/app.py",
+            "bandit --ini /tmp/bandit.ini /pr/app.py",
+            "semgrep --config auto /pr/app.py",
+            "bandit app.py",
+            "bandit /pr/../etc/passwd",
+            "bandit /pr/src/../../etc/passwd",
+        ],
+    )
+    def test_scanner_cannot_read_write_or_fetch_outside_vfs(self, cmd):
+        with pytest.raises(CommandRejected):
+            validate_command(cmd)
+
 
 class TestAccepted:
     @pytest.mark.parametrize(
         "cmd,expected",
         [
             ("bandit -ll /pr/app.py", ["bandit", "-ll", "/pr/app.py"]),
-            (
-                "semgrep --config auto /pr/x.py",
-                ["semgrep", "--config", "auto", "/pr/x.py"],
-            ),
             ("bandit -f json -ll /pr/a.py", ["bandit", "-f", "json", "-ll", "/pr/a.py"]),
+            (
+                "bandit -q --format yaml /pr/src/a.py",
+                ["bandit", "-q", "--format", "yaml", "/pr/src/a.py"],
+            ),
         ],
     )
     def test_scanner_invocations(self, cmd, expected):

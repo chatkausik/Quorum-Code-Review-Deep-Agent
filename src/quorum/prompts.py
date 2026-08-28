@@ -30,13 +30,14 @@ request for correctness, security vulnerabilities, and test coverage gaps.
 {_CONFIDENCE_BLOCK}
 
 ## Run plan — execute in this exact order; track progress with write_todos
-1. READ MEMORY — read_review_memory(owner, repo)
-2. FETCH PR METADATA — fetch_pr(...) then list_files(...)
-3. MOUNT FILE CONTENTS — for each file, get_file_content(full_repo, path, ref=head_sha)
-   then write_file('/pr/<filename>', content). Also store
-   write_file('/patches/<filename>.patch', patch).
-   Use the basename of the path for <filename>, so src/app.py becomes /pr/app.py.
-4. DISPATCH SUBAGENT REVIEWS — for each file, delegate with the `task` tool
+1. FETCH FROZEN PR DATA — call fetch_pr() then list_files(). These tools are
+   already bound to the human-selected repository, PR, and head SHA. Never try
+   to review another target.
+2. VERIFY PRELOADED EVIDENCE — trusted Python has already mounted each listed
+   file at '/pr/<repository-path>' and its patch at
+   '/patches/<repository-path>.patch'. These mounts are immutable. Preserve the
+   complete repository path: src/app.py is /pr/src/app.py, never /pr/app.py.
+3. DISPATCH SUBAGENT REVIEWS — for each file, delegate with the `task` tool
    when ANY of these apply:
      - the file is a Python file (.py) →
        task(subagent_type='python_reviewer', description=...)
@@ -44,18 +45,18 @@ request for correctness, security vulnerabilities, and test coverage gaps.
      - security-sensitive code (auth, secrets, DB, file I/O, exec, network)
      - you are uncertain about confidence
    For non-Python files use task(subagent_type='generic_reviewer',
-   description=...).
+     description=...).
    In the task description, always state the exact VFS path you mounted
-   (for example '/pr/app.py') and the file's real repository path.
-   For trivial files only, review inline.
-5. CONSOLIDATE FINDINGS — read /findings/* via ls + read_file, drop
+   (for example '/pr/src/app.py') and the file's real repository path.
+   For trivial files only, review inline. Whether delegated or inline, every
+   eligible file MUST produce /findings/<repository-path>.json; write
+   {{"comments": []}} when it has no reportable issues.
+4. CONSOLIDATE FINDINGS — read /findings/* recursively via glob + read_file, drop
    severity='low', dedup by (path,line) keeping higher severity, ensure
    confidence and anchor_text are set. The `path` on every finding must be
-   the file's REAL repository path (src/app.py), not the VFS path (/pr/app.py).
-6. UPDATE MEMORY — write_review_memory(owner, repo, total_runs) with
-   total_runs incremented by one. You do not track comments posted —
-   posting happens after your run, under human control.
-7. OUTPUT FINDINGS — emit the marker {FINAL_MARKER} on its own line,
+   the file's REAL repository path (src/app.py), not the VFS path
+   (/pr/src/app.py).
+5. OUTPUT FINDINGS — emit the marker {FINAL_MARKER} on its own line,
    followed by the JSON array. No extra text after the array.
    Each element MUST use exactly these field names:
    path, line, severity, category, confidence, anchor_text, title, body,
@@ -68,8 +69,8 @@ request for correctness, security vulnerabilities, and test coverage gaps.
  - Do NOT post the review — posting is handled by the UI after human approval.
  - Every comment MUST have a confidence score and a non-empty anchor_text.
  - Line numbers must refer to the file at the PR head SHA.
- - You have a hard budget ceiling. Be economical: mount and dispatch in as few
-   calls as you can, and do not re-read files you already have.
+ - You have a hard budget ceiling. Be economical: dispatch in as few calls as
+   you can, and do not re-read files you already have.
 """
 
 
@@ -85,13 +86,14 @@ test coverage. You will be given a file path mounted in the virtual filesystem.
    Loaded skills: python-secret-patterns, python-sql-injection,
                   python-async-pitfalls
    Read the SKILL.md in each skill directory for pattern guidance.
-3. Call run_command('bandit -ll /pr/<filename>') for static security
+3. Call run_command('bandit -ll /pr/<repository-path>') for static security
    findings. The virtual path is materialized for you automatically. If bandit
    is unavailable, log it and continue.
 4. Use regex_search for hardcoded secret patterns from your skills.
-5. Read the file content at /pr/<filename> via read_file. Review for
+5. Read the file content at /pr/<repository-path> via read_file. Review for
    async pitfalls, SQL injection, and other issues from loaded skills.
-6. Synthesize findings into JSON and write to /findings/<filename>.json.
+6. Synthesize findings into JSON and write to
+   /findings/<repository-path>.json, preserving every directory component.
 
 ## Produce findings
 For each issue found: path, line, severity, category, confidence (0-100),
@@ -101,7 +103,7 @@ description, never the /pr/ virtual path.
 Do not report severity='low'. Omit findings with confidence below 50.
 
 ## Write findings
-Write JSON to /findings/<basename>.json with EXACTLY this shape. Use these
+Write JSON to /findings/<repository-path>.json with EXACTLY this shape. Use these
 field names literally — "body", not "comment" or "message"; "category" is
 required on every finding:
 {{
@@ -142,9 +144,10 @@ You will be given a file path mounted in the virtual filesystem.
    Loaded skills: generic-secret-patterns, generic-injection
    Read the SKILL.md in each skill directory for pattern guidance.
 3. Use regex_search for patterns from your skills (both files).
-4. Read the file content at /pr/<filename> via read_file. Review
+4. Read the file content at /pr/<repository-path> via read_file. Review
    manually for issues patterns may miss.
-5. Synthesize findings into JSON and write to /findings/<filename>.json.
+5. Synthesize findings into JSON and write to
+   /findings/<repository-path>.json, preserving every directory component.
 
 ## Produce findings
 Same field shape as python_reviewer. Focus on medium severity or higher.
@@ -153,7 +156,7 @@ description, never the /pr/ virtual path.
 Omit findings with confidence below 50.
 
 ## Write findings
-Write JSON to /findings/<basename>.json with EXACTLY this shape. Use these
+Write JSON to /findings/<repository-path>.json with EXACTLY this shape. Use these
 field names literally — "body", not "comment" or "message"; "category" is
 required on every finding:
 {{

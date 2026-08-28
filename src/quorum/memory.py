@@ -1,9 +1,8 @@
 """Per-repo statistics that survive process restarts.
 
-Most LangChain examples are stateless; this store is the seam where the agent
-stretches into persistent state. The schema is deliberately small but
-extensible — recording rejected findings here would let a future run suppress
-patterns a human has already dismissed.
+This legacy-compatible store intentionally contains aggregate counters only.
+Finding-level decisions, run health, and evaluation cases live in the SQLite
+improvement store so model-facing graph state never owns durable feedback.
 """
 
 from __future__ import annotations

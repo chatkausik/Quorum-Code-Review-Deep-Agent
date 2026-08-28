@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import PurePosixPath
 
 from github import Auth, Github
 from github.GithubException import GithubException
 from langchain.tools import tool
+from langchain_core.tools import BaseTool
 from unidiff import PatchSet
 
 from quorum.config import REVIEW_DOCS, github_token
@@ -41,6 +43,35 @@ DOC_DIR_MARKERS = ("/docs/", "/doc/")
 MAX_FILE_CHARS = 100_000
 
 
+class StaleReviewError(RuntimeError):
+    """Raised when a pull request changed after Quorum reviewed it."""
+
+
+class UnsupportedReviewFile(ValueError):
+    """Raised for changed content that cannot be reviewed as UTF-8 text."""
+
+
+@dataclass(frozen=True)
+class ChangedFile:
+    path: str
+    status: str
+    additions: int
+    deletions: int
+    patch: str
+    # Trusted content frozen at the same head SHA as the manifest. It is not
+    # returned by list_files because the agent reads it from the preloaded VFS.
+    content: str = ""
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "status": self.status,
+            "additions": self.additions,
+            "deletions": self.deletions,
+            "patch": self.patch,
+        }
+
+
 @lru_cache(maxsize=1)
 def _client() -> Github:
     return Github(auth=Auth.Token(github_token()))
@@ -65,6 +96,17 @@ def should_skip(path: str, review_docs: bool | None = None) -> bool:
         return True
     allow_docs = REVIEW_DOCS if review_docs is None else review_docs
     return is_doc(path) and not allow_docs
+
+
+def is_safe_repo_path(path: str) -> bool:
+    """Whether a GitHub path can be represented safely in Quorum's VFS."""
+    candidate = PurePosixPath(path)
+    return bool(
+        path
+        and not path.startswith("/")
+        and "\x00" not in path
+        and all(part not in ("", ".", "..") for part in candidate.parts)
+    )
 
 
 VALID_SLUG = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -142,6 +184,118 @@ def load_pr_context(owner: str, repo: str, pr_number: int) -> ReviewContext:
     )
 
 
+def load_changed_files(
+    context: ReviewContext, *, review_docs: bool = False
+) -> tuple[list[ChangedFile], list[str]]:
+    """Fetch and freeze the eligible file manifest for one reviewed head SHA."""
+    pull = _client().get_repo(context.full_repo).get_pull(context.pr_number)
+    if pull.head.sha != context.head_sha:
+        raise StaleReviewError(
+            f"PR #{context.pr_number} changed from {context.head_sha[:7]} to "
+            f"{pull.head.sha[:7]} while the review was starting. Run it again."
+        )
+
+    files: list[ChangedFile] = []
+    skipped: list[str] = []
+    for item in pull.get_files():
+        if (
+            item.status == "removed"
+            or should_skip(item.filename, review_docs=review_docs)
+            or not is_safe_repo_path(item.filename)
+        ):
+            skipped.append(item.filename)
+            continue
+        try:
+            content = _load_file_content(
+                context.full_repo, item.filename, context.head_sha
+            )
+        except UnsupportedReviewFile:
+            skipped.append(item.filename)
+            continue
+        files.append(
+            ChangedFile(
+                path=item.filename,
+                status=item.status,
+                additions=item.additions,
+                deletions=item.deletions,
+                patch=item.patch or "",
+                content=content,
+            )
+        )
+    return files, skipped
+
+
+def _load_file_content(full_repo: str, path: str, ref: str) -> str:
+    """Load reviewable text, preserving GitHub failures as real run failures."""
+    blob = _client().get_repo(full_repo).get_contents(path, ref=ref)
+    if isinstance(blob, list):
+        raise UnsupportedReviewFile(f"{path} is a directory, not a file")
+    try:
+        content = blob.decoded_content.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError) as exc:
+        raise UnsupportedReviewFile(
+            f"{path} is not UTF-8 text (likely binary)"
+        ) from exc
+    if len(content) > MAX_FILE_CHARS:
+        content = content[:MAX_FILE_CHARS] + "\n... file truncated"
+    return content
+
+
+def _read_file_content(full_repo: str, path: str, ref: str) -> str:
+    """Tool-friendly wrapper that turns content failures into text results."""
+    try:
+        return _load_file_content(full_repo, path, ref)
+    except GithubException as exc:
+        return f"ERROR reading {path}: {exc.data.get('message', exc)}"
+    except UnsupportedReviewFile as exc:
+        return f"ERROR: {exc}."
+
+
+def make_pr_tools(
+    context: ReviewContext, changed_files: list[ChangedFile], skipped: list[str]
+) -> list[BaseTool]:
+    """Create GitHub tools bound to exactly one PR, SHA, and file manifest."""
+    by_path = {item.path: item for item in changed_files}
+
+    @tool("fetch_pr")
+    def scoped_fetch_pr() -> str:
+        """Return metadata for the pull request selected by the human."""
+        return json.dumps(
+            {
+                "title": context.title,
+                "body": context.body[:4000],
+                "head_sha": context.head_sha,
+                "base_sha": context.base_sha,
+                "author": context.author,
+            },
+            indent=2,
+        )
+
+    @tool("list_files")
+    def scoped_list_files() -> str:
+        """List eligible changed files from the frozen reviewed-head manifest."""
+        return json.dumps(
+            {"files": [item.as_dict() for item in changed_files], "skipped": skipped},
+            indent=2,
+        )
+
+    @tool("get_file_content")
+    def scoped_get_file_content(path: str) -> str:
+        """Read one eligible changed file at the frozen pull-request head SHA.
+
+        Args:
+            path: Exact repository path returned by list_files.
+        """
+        if path not in by_path:
+            return (
+                f"REJECTED: {path!r} is not an eligible changed file in "
+                f"{context.full_repo}#{context.pr_number}."
+            )
+        return by_path[path].content
+
+    return [scoped_fetch_pr, scoped_list_files, scoped_get_file_content]
+
+
 @tool
 def fetch_pr(owner: str, repo: str, pr_number: int) -> str:
     """Fetch pull request metadata: title, body, head SHA, base SHA, and author.
@@ -211,19 +365,7 @@ def get_file_content(full_repo: str, path: str, ref: str) -> str:
         path: File path within the repository.
         ref: Git ref — use the PR's head SHA so line numbers match the diff.
     """
-    try:
-        blob = _client().get_repo(full_repo).get_contents(path, ref=ref)
-    except GithubException as exc:
-        return f"ERROR reading {path}: {exc.data.get('message', exc)}"
-    if isinstance(blob, list):
-        return f"ERROR: {path} is a directory, not a file."
-    try:
-        content = blob.decoded_content.decode("utf-8")
-    except (UnicodeDecodeError, AttributeError):
-        return f"ERROR: {path} is not UTF-8 text (likely binary)."
-    if len(content) > MAX_FILE_CHARS:
-        content = content[:MAX_FILE_CHARS] + "\n... file truncated"
-    return content
+    return _read_file_content(full_repo, path, ref)
 
 
 @lru_cache(maxsize=64)
@@ -276,17 +418,25 @@ def re_anchor(
     LLMs hallucinate line numbers; the verbatim anchor text is far more
     reliable. Returns the (possibly corrected) comment and whether it moved.
     """
-    target = comment.anchor_text.strip()
-    if not target:
-        return comment, False
-
-    matches = [i for i, text in enumerate(file_lines, start=1) if text.strip() == target]
+    matches = anchor_line_numbers(comment, file_lines)
     if not matches or comment.line in matches:
         return comment, False
 
     # Several identical lines can match; prefer the one nearest the claim.
     best = min(matches, key=lambda n: abs(n - comment.line))
     return comment.model_copy(update={"line": best}), True
+
+
+def anchor_line_numbers(comment: ReviewComment, file_lines: list[str]) -> list[int]:
+    """Return every line matching the required anchor, ignoring indentation."""
+    target = comment.anchor_text.strip()
+    if not target:
+        return []
+    return [
+        index
+        for index, text in enumerate(file_lines, start=1)
+        if text.strip() == target
+    ]
 
 
 def post_approved_review(
@@ -304,11 +454,21 @@ def post_approved_review(
 
     repository = _client().get_repo(context.full_repo)
     pull = repository.get_pull(context.pr_number)
+    current_head = pull.head.sha
+    if current_head != context.head_sha:
+        raise StaleReviewError(
+            f"PR #{context.pr_number} changed from reviewed head "
+            f"{context.head_sha[:7]} to {current_head[:7]}. Run a new review "
+            "before posting; approvals from the old diff were not used."
+        )
+
+    added = added_lines_by_path(pull)
 
     # Pass 1 — re-anchor by anchor_text against the file at head.
     file_cache: dict[str, list[str]] = {}
-    corrected: list[ReviewComment] = []
+    corrected: list[tuple[ReviewComment, str]] = []
     re_anchored: list[str] = []
+    invalid_anchors: list[str] = []
     for comment in comments:
         if comment.path not in file_cache:
             try:
@@ -317,18 +477,31 @@ def post_approved_review(
                 file_cache[comment.path] = text.splitlines()
             except (GithubException, UnicodeDecodeError, AttributeError):
                 file_cache[comment.path] = []
-        moved_comment, moved = re_anchor(comment, file_cache[comment.path])
-        if moved:
+
+        matches = anchor_line_numbers(comment, file_cache[comment.path])
+        if not matches:
+            invalid_anchors.append(
+                f"{comment.path}:{comment.line} — anchor text was not found at the reviewed head"
+            )
+            continue
+
+        # When identical lines occur, prefer an added-line match before using
+        # distance from the model's claimed line as the tie-breaker.
+        added_matches = [line for line in matches if line in added.get(comment.path, set())]
+        candidates = added_matches or matches
+        best = min(candidates, key=lambda line: abs(line - comment.line))
+        moved_comment = comment.model_copy(update={"line": best})
+        if best != comment.line:
             re_anchored.append(
                 f"{comment.path}: line {comment.line} -> {moved_comment.line}"
             )
-        corrected.append(moved_comment)
+        corrected.append((moved_comment, f"{comment.path}:{comment.line}"))
 
     # Pass 2 — drop anything not on the '+' side of the diff.
-    added = added_lines_by_path(pull)
     payload = []
     dropped: list[str] = []
-    for comment in corrected:
+    posted_locations: list[str] = []
+    for comment, original_location in corrected:
         valid = added.get(comment.path, set())
         if comment.line not in valid:
             dropped.append(f"{comment.path}:{comment.line} — not on the added side")
@@ -341,9 +514,15 @@ def post_approved_review(
                 "body": comment.formatted_body(),
             }
         )
+        posted_locations.append(original_location)
 
     if not payload:
-        return PostResult(posted=0, dropped_off_diff=dropped, re_anchored=re_anchored)
+        return PostResult(
+            posted=0,
+            dropped_off_diff=dropped,
+            re_anchored=re_anchored,
+            dropped_invalid_anchor=invalid_anchors,
+        )
 
     try:
         review = pull.create_review(
@@ -373,4 +552,6 @@ def post_approved_review(
         dropped_off_diff=dropped,
         re_anchored=re_anchored,
         review_url=getattr(review, "html_url", None),
+        dropped_invalid_anchor=invalid_anchors,
+        posted_locations=posted_locations,
     )
