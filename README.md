@@ -12,18 +12,20 @@ human casts the deciding vote before anything is posted.
 
 Findings surface in a Streamlit UI bucketed by confidence. You approve what
 should go out, and a single GitHub review is posted with every comment prefixed
-`[AI Review]`.
+with its AI-review attribution, severity, and category.
 
 ## How it works
 
 ```
-Streamlit UI  ──run_review()──▶  Deep Agent Orchestrator (claude-opus-5)
+Streamlit UI  ──run_review()──▶  Deep Agent Orchestrator (configured model)
+                                          ▲
+                         frozen manifest + immutable source
                                           │
                                  task(name=...) delegates per file
                                           │
                           ┌───────────────┴───────────────┐
                     python_reviewer                 generic_reviewer
-                    (claude-sonnet-5)               (claude-sonnet-5)
+                    (configured model)              (configured model)
                     regex_search, bandit            regex_search
                     3 Python skills                 2 generic skills
                           └───────────────┬───────────────┘
@@ -35,18 +37,52 @@ Streamlit UI  ──run_review()──▶  Deep Agent Orchestrator (claude-opus-
                                           │
                      post_approved_review()  ── deterministic, no LLM
                        re-anchor → unidiff validate → one review
+                                          │
+                           SQLite outcomes + health contracts
 ```
 
 The orchestrator is a loop, not a pipeline. What is *not* left to the model:
-the budget ceiling, the PR metadata, line-number validation, and the decision
-to post.
+the budget ceiling, target and head SHA, eligible-file manifest, source
+mounting, line-number validation, health evaluation, and the decision to post.
+
+## What it looks like
+
+Captured from a live Economy-profile run against the public sandbox PR
+`chatkausik/Evidensia.AI#7`.
+
+**Findings are one row each — severity, description, `file:line`, confidence.**
+Rows at or above the threshold arrive pre-selected for posting.
+
+![Quorum findings list](docs/images/quorum-findings.png)
+
+**Clicking a row opens the evidence, not more prose:** the offending line
+highlighted in context, why it matters, and a colour-coded suggested fix.
+
+![Quorum finding detail](docs/images/quorum-finding-detail.png)
+
+**The Improve tab is the thing to read before trusting a low finding count.**
+Thirteen deterministic contracts are evaluated against trusted run state rather
+than model claims; failures become fingerprinted, recurring issues.
+
+![Quorum improve tab](docs/images/quorum-improve-issues.png)
+
+The [operations guide](docs/OPERATIONS_GUIDE.md#ui-screenshots) has the full
+set, including the empty state and a run in progress.
+
+## Documentation
+
+- [Operations and event guide](docs/OPERATIONS_GUIDE.md) — annotated runtime
+  flows, event catalog, Claude routing, health contracts, feedback lifecycle,
+  posting boundary, and screenshot plan.
+- [Architecture reference](ARCHITECTURE.md) — component contracts, trust
+  boundaries, API adaptations, and historical benchmark notes.
 
 ## Setup
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-cp .env.example .env      # then fill in both keys
+cp .env.example .env      # then fill in GitHub + the selected model provider
 ```
 
 `.env` needs:
@@ -57,6 +93,7 @@ cp .env.example .env      # then fill in both keys
 | `ANTHROPIC_API_KEY` | Only if `MODEL_PROVIDER=anthropic` |
 | `GITHUB_TOKEN` | Read the PR, post the review. Classic PAT with `repo`, or fine-grained with *Pull requests: read and write* |
 | `LANGSMITH_API_KEY` | Optional. Enables tracing and the in-app trace links |
+| `REVIEW_IMPROVEMENT_DB` | Optional SQLite path for health, decisions, and evaluation cases; defaults under `REVIEW_MEMORY_DIR` |
 
 ### Cost profiles
 
@@ -95,9 +132,10 @@ markdown report.
 .venv/bin/python -m pytest
 ```
 
-Covers line-number re-anchoring, unidiff validation, the sandbox allowlist, the
-cost kill switch, finding normalization, and memory persistence. No network or
-credentials required.
+Covers line-number re-anchoring, stale-head rejection, bound GitHub tools,
+immutable VFS boundaries, scanner argument validation, the cost kill switch,
+health contracts, finding normalization, and SQLite feedback persistence. No
+network or credentials required.
 
 ## Design notes
 
@@ -139,9 +177,40 @@ candidate findings". Keeping the gate in the UI makes it provider-agnostic and
 version-independent, and turns "add Slack approval" into a UI change rather
 than an agent change.
 
-**The host filesystem is never touched.** `/pr/`, `/findings/`, and
-`/patches/` live in agent state. Only `/skills/` is backed by real disk, and
-read-only.
+**PR evidence is preloaded and immutable.** Trusted Python freezes the eligible
+manifest and file content at one head SHA before the graph starts. `/pr/` and
+`/patches/` are read-only to agents; they may only write JSON below
+`/findings/`. The scanner accepts a narrow Bandit reporting grammar over exact
+`/pr/` files and runs without a shell in a temporary directory. `/skills/` is
+backed by real disk and mounted read-only.
+
+## Improvement loop
+
+The implementation incorporates the useful control-loop patterns from
+[agent-improvement-loop](https://github.com/yashprogrammer/agent-improvement-loop)
+without giving the reviewer authority to rewrite its own code or open pull
+requests:
+
+1. Each run receives a stable ID and is evaluated against deterministic health
+   contracts: frozen-source integrity, eligible-file coverage, finding scope,
+   anchor validity, completion, and budget compliance.
+2. Failed contracts are deduplicated into recurring improvement issues in
+   SQLite. The **Improve** tab lists them by status and every transition is
+   reversible: an issue can be muted, marked fixed, unmuted, or reopened. A
+   recurrence reopens a fixed issue but leaves a muted one muted, and
+   re-persisting the same run neither inflates its occurrence count nor
+   reopens an issue a human closed.
+3. Approval/rejection and actual postability are stored as evaluation labels.
+   Use **Save Approval Feedback** to retain decisions even when nothing should
+   be posted.
+4. The stored evaluation payload contains repository/path/line and review
+   metadata plus a one-way anchor hash. Source, patches, PR descriptions,
+   finding bodies, suggestions, and anchors are not stored in the improvement
+   database.
+
+This is deliberately a supervised improvement loop: it gathers evidence and
+prioritizes failures, but does not autonomously edit prompts, change code, or
+push to GitHub.
 
 See `ARCHITECTURE.md` for the component reference and the deviations from the
 original specification.
