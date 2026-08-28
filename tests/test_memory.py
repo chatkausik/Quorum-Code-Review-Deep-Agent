@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -53,9 +54,10 @@ class TestPersistence:
     def test_slash_in_key_does_not_escape_the_directory(self, store_dir):
         store = FileBackedStore(store_dir)
         store.record_run("acme", "widgets")
-        files = list(store_dir.glob("*.json"))
-        assert len(files) == 1
-        assert "/" not in files[0].name
+        assert store.path.parent == store_dir
+        with sqlite3.connect(store.path) as conn:
+            key = conn.execute("SELECT key FROM store_entries").fetchone()[0]
+        assert key == "acme/widgets"
 
     def test_corrupt_file_does_not_break_loading(self, store_dir):
         store = FileBackedStore(store_dir)
@@ -64,11 +66,39 @@ class TestPersistence:
         reloaded = FileBackedStore(store_dir)
         assert reloaded.get_stats("acme", "widgets")["total_runs"] == 1
 
-    def test_written_file_is_readable_json(self, store_dir):
-        FileBackedStore(store_dir).record_run("acme", "widgets")
-        payload = json.loads(next(store_dir.glob("*.json")).read_text())
-        assert payload["namespace"] == list(NAMESPACE)
-        assert payload["key"] == repo_key("acme", "widgets")
+    def test_written_record_is_readable_from_sqlite(self, store_dir):
+        store = FileBackedStore(store_dir)
+        store.record_run("acme", "widgets")
+        with sqlite3.connect(store.path) as conn:
+            namespace, key, value_json = conn.execute(
+                "SELECT namespace,key,value_json FROM store_entries"
+            ).fetchone()
+        assert json.loads(namespace) == list(NAMESPACE)
+        assert key == repo_key("acme", "widgets")
+        assert json.loads(value_json)["total_runs"] == 1
+
+    def test_separate_sessions_increment_atomically(self, store_dir):
+        first = FileBackedStore(store_dir)
+        second = FileBackedStore(store_dir)
+
+        first.record_run("acme", "widgets")
+        second.record_run("acme", "widgets")
+
+        assert FileBackedStore(store_dir).get_stats("acme", "widgets")["total_runs"] == 2
+
+    def test_legacy_json_is_imported_once(self, store_dir):
+        store_dir.mkdir(parents=True)
+        legacy = {
+            "namespace": list(NAMESPACE),
+            "key": repo_key("acme", "widgets"),
+            "value": {"total_runs": 4, "total_comments_posted": 2, "last_review_at": None},
+        }
+        (store_dir / "legacy.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+        store = FileBackedStore(store_dir)
+        assert store.get_stats("acme", "widgets")["total_runs"] == 4
+        # Reopening must not import and add the same legacy value again.
+        assert FileBackedStore(store_dir).get_stats("acme", "widgets")["total_runs"] == 4
 
 
 class TestPostedCounterIntegrity:
@@ -82,8 +112,6 @@ class TestPostedCounterIntegrity:
         assert set(params) == {"owner", "repo", "total_runs"}
 
     def test_existing_posted_count_survives_an_agent_write(self, store_dir):
-        from langgraph.config import get_store
-
         store = FileBackedStore(store_dir)
         store.record_posted("acme", "widgets", 7)
 

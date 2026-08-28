@@ -277,6 +277,24 @@ class ImprovementStore:
         label: str,
         now: str,
     ) -> None:
+        # Human decisions and posting outcomes are two independent dimensions.
+        # Within each dimension, however, labels are mutually exclusive: a
+        # finding that a reviewer changes from rejected to approved must not
+        # remain both a positive and a negative evaluation example.
+        dimensions = {
+            "approved": ("approved", "rejected"),
+            "rejected": ("approved", "rejected"),
+            "posted": ("posted", "postability_failure"),
+            "postability_failure": ("posted", "postability_failure"),
+        }
+        exclusive = dimensions.get(label)
+        if exclusive:
+            placeholders = ",".join("?" for _ in exclusive)
+            conn.execute(
+                "DELETE FROM evaluation_cases WHERE run_id=? AND finding_id=? "
+                f"AND label IN ({placeholders})",
+                (result.run_id, finding_id(comment), *exclusive),
+            )
         payload = {
             "repository": result.context.full_repo,
             "head_sha": result.context.head_sha,

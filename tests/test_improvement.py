@@ -105,6 +105,32 @@ def test_health_contract_rejects_invalid_or_out_of_scope_artifacts():
     assert not by_name["finding_artifact_scope"].passed
 
 
+def test_health_contract_surfaces_missing_diff_and_preapproval_rejections():
+    checks = evaluate_run_health(
+        expected_paths={"src/app.py"},
+        expected_content={"src/app.py": "x = 1\n"},
+        expected_patches={"src/app.py": ""},
+        postability_failures={"off_diff": ["src/app.py:1 — not on added side"]},
+        comments=[],
+        state={
+            "files": {
+                "/pr/src/app.py": {"content": "x = 1\n"},
+                "/findings/src/app.py.json": {"content": '{"comments": []}'},
+            }
+        },
+        error=None,
+        budget_exceeded=False,
+        total_cost_usd=0.1,
+        llm_calls=3,
+        max_cost_usd=1.0,
+        max_llm_calls=25,
+    )
+    by_name = {check.name: check for check in checks}
+
+    assert not by_name["diff_availability"].passed
+    assert not by_name["finding_postability"].passed
+
+
 def test_review_failures_become_deduplicated_improvement_issues(tmp_path):
     store = ImprovementStore(tmp_path / "improvement.db")
     failure = HealthCheck(
@@ -170,6 +196,27 @@ def test_human_decisions_and_postability_create_sanitized_eval_cases(tmp_path):
     serialized = json.dumps(payloads)
     assert comment.anchor_text not in serialized
     assert comment.body not in serialized
+
+
+def test_changed_human_decision_replaces_the_old_eval_label(tmp_path):
+    store = ImprovementStore(tmp_path / "improvement.db")
+    result = make_result()
+    comment = result.comments[0]
+    store.record_review(result)
+
+    store.record_decisions(result, [])
+    store.record_decisions(result, [comment])
+
+    with sqlite3.connect(store.path) as conn:
+        labels = [
+            row[0]
+            for row in conn.execute(
+                "SELECT label FROM evaluation_cases ORDER BY label"
+            )
+        ]
+        current = conn.execute("SELECT decision FROM finding_decisions").fetchone()[0]
+    assert current == "approved"
+    assert labels == ["approved"]
 
 
 def _failing(name: str, detail: str = "Contract failed.") -> HealthCheck:

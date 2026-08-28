@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,10 +12,88 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SKILLS_DIR = PROJECT_ROOT / "skills"
+
+
+def _resource_dir(name: str) -> Path:
+    """Resolve a resource in a source checkout or an installed wheel."""
+    override = os.getenv(f"QUORUM_{name.upper()}_DIR")
+    candidates = [
+        Path(override).expanduser() if override else None,
+        PROJECT_ROOT / name,
+        Path(sysconfig.get_path("data")) / "share" / "quorum" / name,
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_dir():
+            return candidate
+    # Keep a deterministic path in the error message produced by build_agent.
+    return PROJECT_ROOT / name
+
+
+SKILLS_DIR = _resource_dir("skills")
+
+
+class ConfigurationError(ValueError):
+    """Raised when an environment setting would make a run ambiguous or unsafe."""
+
+
+def _choice(name: str, value: str, allowed: set[str]) -> str:
+    normalized = value.strip().lower()
+    if normalized not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ConfigurationError(f"{name} must be one of: {choices}; got {value!r}.")
+    return normalized
+
+
+def _env_int(
+    name: str,
+    fallback: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    raw = os.getenv(name)
+    try:
+        value = fallback if raw is None else int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer; got {raw!r}.") from exc
+    if minimum is not None and value < minimum:
+        raise ConfigurationError(f"{name} must be at least {minimum}; got {value}.")
+    if maximum is not None and value > maximum:
+        raise ConfigurationError(f"{name} must be at most {maximum}; got {value}.")
+    return value
+
+
+def _env_float(name: str, fallback: float, *, minimum: float | None = None) -> float:
+    raw = os.getenv(name)
+    try:
+        value = fallback if raw is None else float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a number; got {raw!r}.") from exc
+    if minimum is not None and value < minimum:
+        raise ConfigurationError(f"{name} must be at least {minimum}; got {value}.")
+    return value
+
+
+def _env_bool(name: str, fallback: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return fallback
+    normalized = raw.strip().lower()
+    if normalized not in {"true", "false"}:
+        raise ConfigurationError(f"{name} must be true or false; got {raw!r}.")
+    return normalized == "true"
+
+
+def _env_text(name: str, fallback: str) -> str:
+    value = os.getenv(name, fallback).strip()
+    if not value:
+        raise ConfigurationError(f"{name} must not be empty.")
+    return value
 
 # --- provider -------------------------------------------------------------
-MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "openai").strip().lower()
+MODEL_PROVIDER = _choice(
+    "MODEL_PROVIDER", os.getenv("MODEL_PROVIDER", "openai"), {"openai", "anthropic"}
+)
 
 # --- cost profiles --------------------------------------------------------
 # Measured on a 4-file review: output tokens were 53% of spend and cache
@@ -83,23 +162,35 @@ PROFILE_LABELS = {
     "thorough": "Thorough — ~$1+/PR. Deepest analysis, highest cost.",
 }
 
-if MODEL_PROVIDER not in COST_PROFILES:
-    MODEL_PROVIDER = "openai"
-COST_PROFILE = os.getenv("REVIEW_COST_PROFILE", "balanced").strip().lower()
-if COST_PROFILE not in PROFILE_LABELS:
-    COST_PROFILE = "balanced"
+COST_PROFILE = _choice(
+    "REVIEW_COST_PROFILE",
+    os.getenv("REVIEW_COST_PROFILE", "balanced"),
+    set(PROFILE_LABELS),
+)
 _profile = COST_PROFILES[MODEL_PROVIDER][COST_PROFILE]
 
 # --- models ---------------------------------------------------------------
 # Orchestrator plans, dispatches and consolidates; subagents do per-file
 # review. Explicit env vars still win over the profile.
-ORCHESTRATOR_MODEL = os.getenv("ORCHESTRATOR_MODEL", _profile["orchestrator_model"])
-SUBAGENT_MODEL = os.getenv("SUBAGENT_MODEL", _profile["subagent_model"])
-ORCHESTRATOR_EFFORT = os.getenv("ORCHESTRATOR_EFFORT", _profile["orchestrator_effort"])
-SUBAGENT_EFFORT = os.getenv("SUBAGENT_EFFORT", _profile["subagent_effort"])
-MAX_OUTPUT_TOKENS = int(os.getenv("REVIEW_MAX_OUTPUT_TOKENS", _profile["max_tokens"]))
+ORCHESTRATOR_MODEL = _env_text(
+    "ORCHESTRATOR_MODEL", str(_profile["orchestrator_model"])
+)
+SUBAGENT_MODEL = _env_text("SUBAGENT_MODEL", str(_profile["subagent_model"]))
+ORCHESTRATOR_EFFORT = _choice(
+    "ORCHESTRATOR_EFFORT",
+    os.getenv("ORCHESTRATOR_EFFORT", str(_profile["orchestrator_effort"])),
+    {"low", "medium", "high"},
+)
+SUBAGENT_EFFORT = _choice(
+    "SUBAGENT_EFFORT",
+    os.getenv("SUBAGENT_EFFORT", str(_profile["subagent_effort"])),
+    {"low", "medium", "high"},
+)
+MAX_OUTPUT_TOKENS = _env_int(
+    "REVIEW_MAX_OUTPUT_TOKENS", int(_profile["max_tokens"]), minimum=1
+)
 # Reviewing prose costs real money and yields soft findings; off by default.
-REVIEW_DOCS = os.getenv("REVIEW_DOCS", str(_profile["review_docs"])).lower() == "true"
+REVIEW_DOCS = _env_bool("REVIEW_DOCS", bool(_profile["review_docs"]))
 
 # USD per 1M tokens, keyed by model id: (input, output).
 PRICING: dict[str, tuple[float, float]] = {
@@ -134,11 +225,17 @@ CACHE_READ_MULTIPLIER = 0.1
 CACHE_WRITE_MULTIPLIER = 1.25 if MODEL_PROVIDER == "anthropic" else 0.0
 
 # --- run limits -----------------------------------------------------------
-MAX_COST_USD = float(os.getenv("REVIEW_MAX_COST_USD", "1.00"))
-MAX_LLM_CALLS = int(os.getenv("REVIEW_MAX_LLM_CALLS", "25"))
+MAX_COST_USD = _env_float("REVIEW_MAX_COST_USD", 1.00, minimum=0.01)
+MAX_LLM_CALLS = _env_int("REVIEW_MAX_LLM_CALLS", 25, minimum=1)
+MAX_REVIEW_FILES = _env_int("REVIEW_MAX_FILES", 50, minimum=1)
+MAX_TOTAL_SOURCE_CHARS = _env_int(
+    "REVIEW_MAX_TOTAL_CHARS", 1_000_000, minimum=1_000
+)
 
 # --- review policy --------------------------------------------------------
-CONFIDENCE_THRESHOLD = int(os.getenv("REVIEW_CONFIDENCE_THRESHOLD", "75"))
+CONFIDENCE_THRESHOLD = _env_int(
+    "REVIEW_CONFIDENCE_THRESHOLD", 75, minimum=0, maximum=100
+)
 FINAL_MARKER = "FINAL_FINDINGS_JSON:"
 
 # --- memory ---------------------------------------------------------------
@@ -206,10 +303,8 @@ SKILLS_MOUNT = "/skills"
 
 
 def resolve_profile(name: str | None = None) -> dict[str, object]:
-    """Return the settings for a cost profile, falling back to the configured one."""
-    key = (name or COST_PROFILE).strip().lower()
-    if key not in PROFILE_LABELS:
-        key = COST_PROFILE
+    """Return one validated cost profile."""
+    key = _choice("REVIEW_COST_PROFILE", name or COST_PROFILE, set(PROFILE_LABELS))
     return dict(COST_PROFILES[MODEL_PROVIDER][key])
 
 
@@ -230,34 +325,44 @@ class ReviewSettings:
     review_docs: bool
     max_cost_usd: float
     max_llm_calls: int
-
-
-def _env_bool(name: str, fallback: bool) -> bool:
-    value = os.getenv(name)
-    return fallback if value is None else value.strip().lower() == "true"
+    max_review_files: int
+    max_total_source_chars: int
 
 
 def resolve_review_settings(name: str | None = None) -> ReviewSettings:
     """Resolve a profile and then apply explicit environment overrides."""
-    requested = (name or COST_PROFILE).strip().lower()
-    profile_name = requested if requested in PROFILE_LABELS else COST_PROFILE
+    profile_name = _choice(
+        "REVIEW_COST_PROFILE", name or COST_PROFILE, set(PROFILE_LABELS)
+    )
     spec = resolve_profile(profile_name)
     return ReviewSettings(
         profile_name=profile_name,
-        orchestrator_model=os.getenv(
+        orchestrator_model=_env_text(
             "ORCHESTRATOR_MODEL", str(spec["orchestrator_model"])
         ),
-        subagent_model=os.getenv("SUBAGENT_MODEL", str(spec["subagent_model"])),
-        orchestrator_effort=os.getenv(
-            "ORCHESTRATOR_EFFORT", str(spec["orchestrator_effort"])
+        subagent_model=_env_text("SUBAGENT_MODEL", str(spec["subagent_model"])),
+        orchestrator_effort=_choice(
+            "ORCHESTRATOR_EFFORT",
+            os.getenv("ORCHESTRATOR_EFFORT", str(spec["orchestrator_effort"])),
+            {"low", "medium", "high"},
         ),
-        subagent_effort=os.getenv(
-            "SUBAGENT_EFFORT", str(spec["subagent_effort"])
+        subagent_effort=_choice(
+            "SUBAGENT_EFFORT",
+            os.getenv("SUBAGENT_EFFORT", str(spec["subagent_effort"])),
+            {"low", "medium", "high"},
         ),
-        max_tokens=int(os.getenv("REVIEW_MAX_OUTPUT_TOKENS", str(spec["max_tokens"]))),
+        max_tokens=_env_int(
+            "REVIEW_MAX_OUTPUT_TOKENS", int(spec["max_tokens"]), minimum=1
+        ),
         review_docs=_env_bool("REVIEW_DOCS", bool(spec["review_docs"])),
-        max_cost_usd=MAX_COST_USD,
-        max_llm_calls=MAX_LLM_CALLS,
+        max_cost_usd=_env_float("REVIEW_MAX_COST_USD", MAX_COST_USD, minimum=0.01),
+        max_llm_calls=_env_int("REVIEW_MAX_LLM_CALLS", MAX_LLM_CALLS, minimum=1),
+        max_review_files=_env_int(
+            "REVIEW_MAX_FILES", MAX_REVIEW_FILES, minimum=1
+        ),
+        max_total_source_chars=_env_int(
+            "REVIEW_MAX_TOTAL_CHARS", MAX_TOTAL_SOURCE_CHARS, minimum=1_000
+        ),
     )
 
 

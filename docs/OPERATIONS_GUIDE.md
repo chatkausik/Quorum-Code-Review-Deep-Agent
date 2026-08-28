@@ -1,7 +1,7 @@
 # Quorum Operations and Event Guide
 
 This guide explains how a pull-request review moves through Quorum, which
-events appear in the Streamlit UI, where Claude models are used, which
+events appear in the Streamlit UI, where configured models are used, which
 boundaries are deterministic, and how human decisions become improvement
 signals.
 
@@ -11,97 +11,119 @@ For implementation-level component notes, see
 
 ## System at a glance
 
+![Quorum system overview from PR admission through deterministic posting](images/quorum-system-overview.png)
+
+Use this visual for orientation and the Mermaid flow below for exact operational
+relationships and failure paths.
+
 ```mermaid
-flowchart LR
+flowchart TD
     Human([Human reviewer])
     UI[Streamlit UI]
 
     subgraph Trusted[Deterministic control plane]
         Loader[PR loader<br/>freeze target + head SHA]
+        Limits{File and character limits}
         Manifest[Eligible-file manifest]
         VFS[(Ephemeral VFS<br/>immutable source + patches)]
-        Health[Health contracts]
-        Post[Post boundary<br/>re-anchor + diff validation]
+        Normalize[Normalize, scope, and deduplicate]
+        FrozenCheck[Pre-approval frozen-diff validation]
+        Health[15 health contracts]
+        Post[Current-state post validation]
     end
 
-    subgraph Agentic[Claude review plane]
-        Orchestrator[Claude Sonnet 5<br/>orchestration + adaptive reasoning]
-        Python[Claude Haiku 4.5<br/>Python reviewer]
-        Generic[Claude Haiku 4.5<br/>generic reviewer]
+    subgraph Agentic[Configured-model review plane]
+        Budget[Shared locked call and cost guard]
+        Orchestrator[Orchestrator model]
+        Python[Python reviewer model]
+        Generic[Generic reviewer model]
         Findings[(JSON findings artifacts)]
     end
 
     GitHub[(GitHub API)]
     Improve[(SQLite improvement store)]
+    Stats[(SQLite repository counters)]
 
     Human -->|select PR + run| UI
     UI --> Loader
     Loader -->|read metadata, files, source| GitHub
-    Loader --> Manifest
+    Loader --> Limits
+    Limits -->|accepted| Manifest
+    Limits -->|too large| UI
     Manifest --> VFS
     VFS --> Orchestrator
+    Budget --> Orchestrator
+    Budget --> Python
+    Budget --> Generic
     Orchestrator -->|delegate Python| Python
     Orchestrator -->|delegate other files| Generic
     Python --> Findings
     Generic --> Findings
     Findings --> Orchestrator
-    Orchestrator -->|candidate comments| Health
+    Orchestrator -->|candidate comments| Normalize
+    Normalize --> FrozenCheck
     Manifest --> Health
     VFS --> Health
+    FrozenCheck --> Health
     Health --> UI
     Health --> Improve
     UI -->|approved comments only| Post
-    Post -->|verify current head| GitHub
+    Post -->|re-read current head and diff| GitHub
     Post -->|one GitHub review| GitHub
     UI -->|approval / rejection| Improve
     Post -->|posted / rejected by boundary| Improve
-
-    classDef human fill:#19324d,stroke:#6cb6ff,color:#fff;
-    classDef trusted fill:#17392f,stroke:#5fbf97,color:#fff;
-    classDef agent fill:#3b2f18,stroke:#e3bc3f,color:#fff;
-    classDef data fill:#2f263d,stroke:#bd93f9,color:#fff;
-    class Human,UI human;
-    class Loader,Manifest,VFS,Health,Post trusted;
-    class Orchestrator,Python,Generic agent;
-    class GitHub,Findings,Improve data;
+    UI <--> Stats
 ```
 
-The separation is intentional. Claude decides how to inspect and delegate a
+The separation is intentional. The configured model decides how to inspect and delegate a
 review, but it cannot change the selected repository, mutate reviewed source,
 write persistent memory, or post to GitHub.
 
-## Current model routing
+## Provider and profile routing
 
-The local deployment is configured with `MODEL_PROVIDER=anthropic` and
-`REVIEW_COST_PROFILE=economy`.
+`MODEL_PROVIDER` selects the provider and `REVIEW_COST_PROFILE` selects one
+validated mapping. Explicit model/effort overrides are accepted only when they
+are non-empty and within the supported effort set.
 
 ```mermaid
 flowchart TD
-    Start([Review request]) --> S5[Claude Sonnet 5<br/>low effort]
-    S5 --> Decide{File type and complexity}
-    Decide -->|Python| Hpy[Claude Haiku 4.5<br/>Python skills + Bandit]
-    Decide -->|YAML, shell, config, other| Hgen[Claude Haiku 4.5<br/>generic security skills]
-    Decide -->|Trivial file| Inline[Sonnet inline review]
-    Hpy --> Artifact["/findings/&lt;path&gt;.json"]
-    Hgen --> Artifact
+    Start([Review request]) --> Provider{MODEL_PROVIDER}
+    Provider -->|openai| OpenAI[Resolve OpenAI profile]
+    Provider -->|anthropic| Anthropic[Resolve Anthropic profile]
+    OpenAI --> Orchestrator[Configured orchestrator model and effort]
+    Anthropic --> Orchestrator
+    Orchestrator --> Decide{File type and complexity}
+    Decide -->|Python| Py[Configured subagent<br/>Python skills + Bandit]
+    Decide -->|Other reviewable file| Generic[Configured subagent<br/>generic security skills]
+    Decide -->|Trivial file| Inline[Orchestrator inline review]
+    Py --> Artifact["/findings/&lt;path&gt;.json"]
+    Generic --> Artifact
     Inline --> Artifact
-    Artifact --> S5
-    S5 --> Final[Consolidated candidates]
-
-    classDef sonnet fill:#3b2f18,stroke:#e3bc3f,color:#fff;
-    classDef haiku fill:#17392f,stroke:#5fbf97,color:#fff;
-    classDef artifact fill:#2f263d,stroke:#bd93f9,color:#fff;
-    class S5,Inline sonnet;
-    class Hpy,Hgen haiku;
-    class Artifact,Final artifact;
+    Artifact --> Orchestrator
+    Orchestrator --> Final[Consolidated candidates]
 ```
 
-Sonnet uses adaptive thinking because orchestration is a multi-step tool-use
-problem. Haiku reviewers do not receive adaptive-thinking parameters: Haiku
-4.5 does not support adaptive or interleaved thinking, and a fixed manual
-thinking budget would increase review cost on every call. The deterministic
-budget middleware still limits the complete run to the configured dollar and
-call ceilings.
+OpenAI models use the Responses API with the configured reasoning effort.
+Anthropic Sonnet/Opus models use adaptive thinking plus the configured effort;
+Haiku 4.5 omits unsupported thinking controls. One budget middleware instance
+still covers the complete agent tree regardless of provider or profile.
+
+### Admission and budget controls
+
+| Control | Enforcement point | Behavior |
+| --- | --- | --- |
+| Provider/profile/effort | Configuration load and per-run settings resolution | Unknown or empty values fail closed; no provider fallback. |
+| Boolean and numeric settings | Configuration load and per-run settings resolution | Malformed booleans and out-of-range confidence, output, cost, call, file, or character limits raise `ConfigurationError`. |
+| Eligible files | Trusted loader, before agent creation | More than `REVIEW_MAX_FILES` refuses the whole run. |
+| Aggregate source | Trusted loader, before agent creation | More than `REVIEW_MAX_TOTAL_CHARS` refuses the whole run. |
+| Individual source | Trusted loader | Content after 100,000 characters is marked truncated and fails run health. |
+| LLM calls | Locked `before_model` hook | Calls are reserved before provider access; request `max + 1` never starts. |
+| Dollar cost | Locked `after_model` hook | Token/cache usage is priced after each response; crossing the threshold halts subsequent work. |
+
+The call count is a hard ceiling. The dollar value is a stop threshold because
+providers do not expose the exact billable token count before returning a
+response. UI meters show the shared totals and per-model rollups from the same
+locked middleware used for enforcement.
 
 ## End-to-end review sequence
 
@@ -113,54 +135,65 @@ sequenceDiagram
     participant Run as run_review()
     participant GH as GitHub API
     participant VFS as Ephemeral VFS
-    participant S as Sonnet orchestrator
-    participant H as Haiku reviewers
-    participant Eval as Health evaluator
+    participant A as Agent tree
+    participant Budget as Shared budget guard
+    participant Valid as Frozen-candidate validator
+    participant Health as Health evaluator
     participant DB as SQLite improvement store
+    participant Stats as SQLite repository counters
 
     Human->>UI: Enter owner, repo, PR, threshold, profile
     Human->>UI: Click Run Review
     UI->>Run: owner, repo, PR, profile, progress callback
     Run->>GH: Load PR identity and head SHA
     Run->>GH: Load changed-file manifest
-    Run->>GH: Load eligible UTF-8 source at frozen head
+    loop Eligible files
+        Run->>GH: Load UTF-8 source at frozen head
+        Run->>Run: Enforce file and aggregate-size limits
+    end
     Run->>VFS: Preload immutable /pr and /patches evidence
-    Run->>S: Start graph with frozen evidence
+    Run->>A: Start graph with frozen evidence
 
-    S->>S: Plan work and read frozen manifest
+    A->>A: Plan work and read frozen manifest
     loop Every eligible file
         alt Python file
-            S->>H: Delegate to python_reviewer
-            H->>VFS: Read /pr/path
-            H->>H: Run Bandit and pattern checks
-            H->>VFS: Write /findings/path.json
+            A->>A: Delegate to python_reviewer
+            A->>Budget: Reserve each provider call
+            Budget-->>A: Allowed or exact call-limit stop
+            A->>VFS: Read /pr/path; run Bandit and pattern checks
+            A->>VFS: Write /findings/path.json
         else Non-Python file
-            S->>H: Delegate to generic_reviewer
-            H->>VFS: Read /pr/path
-            H->>H: Run pattern and manual checks
-            H->>VFS: Write /findings/path.json
+            A->>A: Delegate to generic_reviewer
+            A->>Budget: Reserve each provider call
+            Budget-->>A: Allowed or exact call-limit stop
+            A->>VFS: Read /pr/path; run pattern checks
+            A->>VFS: Write /findings/path.json
         else Trivial file
-            S->>VFS: Read /pr/path inline
-            S->>VFS: Write /findings/path.json
+            A->>Budget: Reserve provider call
+            A->>VFS: Read and review /pr/path inline
+            A->>VFS: Write /findings/path.json
         end
     end
 
-    S->>VFS: Read all findings artifacts
-    S-->>Run: FINAL_FINDINGS_JSON candidates
+    A->>VFS: Read all findings artifacts
+    A-->>Run: FINAL_FINDINGS_JSON candidates
     Run->>Run: Normalize, scope-filter, merge strongest duplicate
-    Run->>Eval: Compare output with manifest and frozen evidence
-    Eval-->>Run: Deterministic health checks
+    Run->>Valid: Re-anchor against frozen source and added diff
+    Valid-->>Run: Retained candidates, moves, and rejection evidence
+    Run->>Health: Compare state and validation with frozen evidence
+    Health-->>Run: 15 deterministic checks
     Run->>DB: Persist run and recurring failures
+    Run->>Stats: Atomic run-counter increment
     Run-->>UI: ReviewResult
     UI-->>Human: Findings, health, costs, and trace
 
     Human->>UI: Approve / reject findings
     UI->>DB: Save decision labels
     opt Post approved comments
-        UI->>GH: Recheck PR head SHA
-        UI->>GH: Read anchors and current diff
+        UI->>GH: Recheck head SHA, source, and current diff
         UI->>GH: Create one validated review
         UI->>DB: Save posted / postability labels
+        UI->>Stats: Atomic posted-comment increment
     end
 ```
 
@@ -170,12 +203,19 @@ sequenceDiagram
   call and records a zero-cost run.
 - If the PR head changes while the manifest is being frozen, the run stops and
   asks for a new review.
-- If a budget or call ceiling interrupts the graph, Quorum recovers the latest
-  checkpoint and marks the output incomplete.
+- If eligible files or aggregate source exceed configured limits, Quorum refuses
+  the run before model execution; it never silently reviews only a prefix.
+- If a cost stop threshold or call ceiling interrupts the graph, Quorum
+  recovers the latest checkpoint and marks the output incomplete. The call
+  ceiling is checked before requests; cost is checked after responses.
+- If a candidate lacks an anchor or cannot land on the frozen added-side diff,
+  it is removed before the approval UI and recorded by `finding_postability`.
+- If frozen patch evidence is missing, `diff_availability` fails even when the
+  remaining run completes.
 - If the reviewed head changes before posting, all approvals from the stale
   diff are rejected.
 - If an anchor is absent or does not land on an added diff line, that comment
-  is not posted.
+  is independently rejected again at posting time.
 
 ## Live event flow
 
@@ -201,18 +241,13 @@ flowchart LR
     Memory --> Fetch[Fetch]
     Fetch --> Mount[Mount]
     Mount --> Review[Review]
-    Review --> Consolidate[Consolidate]
-    Consolidate --> Validate[Validate]
+    Review --> Merge[Merge artifacts and final marker]
+    Merge --> Frozen[Validate against frozen source and diff]
+    Frozen --> Consolidate[Consolidate]
+    Consolidate --> Validate[Validate health]
 
-    Stats[(Stats side channel)] -. after model calls .-> Review
+    Stats[(Locked usage side channel)] -. after model calls .-> Review
     Stats -. final totals .-> Validate
-
-    classDef done fill:#17392f,stroke:#5fbf97,color:#fff;
-    classDef active fill:#3b2f18,stroke:#e3bc3f,color:#fff;
-    classDef side fill:#2f263d,stroke:#bd93f9,color:#fff;
-    class Plan,Memory,Fetch,Mount,Consolidate,Validate done;
-    class Review active;
-    class Stats side;
 ```
 
 ### Event catalog
@@ -220,24 +255,26 @@ flowchart LR
 | Phase | Event | Source | Meaning |
 | --- | --- | --- | --- |
 | Plan | `Starting review of owner/repo#PR` | `run_review` | A unique run ID and selected profile are active. |
-| Plan | `Planning the run` | Sonnet `write_todos` call | The orchestrator decomposed the review. |
+| Plan | `Planning the run` | Orchestrator `write_todos` call | The orchestrator decomposed the review. |
 | Memory | `Loaded trusted historical counters` | `FileBackedStore` | Only integer run/post counters are supplied; the model cannot mutate them. |
 | Fetch | `Froze pull-request target and manifest` | Trusted loader | Repository, PR number, head SHA, eligible paths, and skipped paths are fixed. |
-| Fetch | `Reading frozen PR metadata` | Bound `fetch_pr` tool | Sonnet is reading untrusted title/body data for context. |
+| Fetch | `Reading frozen PR metadata` | Bound `fetch_pr` tool | The orchestrator is reading untrusted title/body data for context. |
 | Fetch | `Reading frozen manifest` | Bound `list_files` tool | The model sees only files selected by trusted Python. |
 | Fetch | `Reading frozen file` | Bound `get_file_content` tool | Content comes from the frozen in-memory copy, not a new arbitrary GitHub read. |
 | Mount | `Preloaded immutable review evidence` | `run_review` | `/pr/` source and `/patches/` diffs are present before the graph starts. |
-| Review | `Delegating to …` | Sonnet `task` call | A specialist subagent receives one exact VFS/repository path. |
-| Review | `Running scanner` | Haiku `run_command` call | Validated Bandit arguments run in a temporary directory without a shell. |
-| Review | `Pattern scan` | Reviewer `regex_search` call | A bounded, timeout-protected regex scan is running. |
+| Review | `Delegating to …` | Orchestrator `task` call | A specialist subagent receives one exact VFS/repository path. |
+| Review | `Running scanner` | Reviewer `run_command` call | Validated Bandit arguments run in a temporary directory without a shell. |
+| Review | `Pattern scan` | Reviewer `regex_search` call | A bounded regex scans one safe `/pr/` path from the frozen backend. |
 | Review | `Reviewer wrote its result` | Reviewer `write_file` call | A JSON findings artifact, including an empty result, was written. |
-| Consolidate | `Reading findings back` | Sonnet filesystem call | Per-file artifacts are being assembled. |
-| Consolidate | `Consolidated candidate findings` | Deterministic parser | Low severity, malformed, duplicate, and out-of-scope items are accounted for. |
-| Validate | `Evaluated deterministic health contract` | Health evaluator | Coverage, integrity, anchors, artifact validity, completion, and budgets were checked. |
+| Consolidate | `Reading findings back` | Orchestrator filesystem call | Per-file artifacts are being assembled. |
+| Consolidate | `Consolidated candidate findings` | Deterministic parser and frozen validator | Low severity, malformed, duplicate, out-of-scope, invalid-anchor, and off-diff items are accounted for; valid moves are re-anchored. |
+| Validate | `Evaluated deterministic health contract` | Health evaluator | Fifteen coverage, integrity, patch, anchor, postability, completion, and budget checks were evaluated. |
 | Any model phase | `stats` update | Cost middleware | Calls, tokens, cache usage, and cost meters refresh. |
 
 The progress feed is observational. It does not grant new capabilities; trust
 boundaries are enforced in tool schemas, backends, and deterministic Python.
+Target lookup, source loading, and size enforcement happen before the first
+progress event; failure there is shown directly by the Streamlit status panel.
 
 ## Health contracts
 
@@ -253,10 +290,12 @@ failures for the repository.
 | `finding_artifact_scope` | A findings artifact belongs to an unknown file. |
 | `finding_artifact_validity` | An artifact is malformed or lacks a JSON comments list. |
 | `source_truncation` | A file exceeded the configured review size limit. |
+| `diff_availability` | GitHub omitted or failed to provide patch evidence for an eligible file. |
 | `finding_path_scope` | A candidate comment refers to an ineligible path. |
 | `finding_anchor_exists` | The claimed anchor does not exist at the reviewed head. |
 | `finding_line_in_file` | A claimed line is outside the file. |
 | `finding_anchor_at_claimed_line` | The anchor exists elsewhere and requires re-anchoring. |
+| `finding_postability` | A candidate was rejected before approval because its anchor was missing or off the added-side diff. |
 | `run_budget` | Cost/call ceilings were exceeded or halted the run. |
 | `run_completed` | The graph ended with an error. |
 
@@ -266,19 +305,21 @@ failures for the repository.
 flowchart TD
     Run[Review run] --> Contract[Evaluate health contracts]
     Run --> RunStore[(review_runs)]
-    Run --> Candidate[Candidate finding]
+    Run --> Candidate[Normalized candidate finding]
+    Candidate --> Frozen{Postable on frozen added diff?}
+    Frozen -->|no| Contract
+    Frozen -->|yes| Human{Human decision}
     Contract -->|pass| Healthy[Health result retained on run]
     Contract -->|fail| Issue[(improvement_issues)]
-    Candidate --> Human{Human decision}
-    Human -->|approve| Approved[approved label]
-    Human -->|reject + reason| Rejected[rejected label]
+    Human -->|approve; replace rejected| Approved[approved label]
+    Human -->|reject; replace approved| Rejected[rejected label]
     Approved --> Decisions[(finding_decisions)]
     Rejected --> Decisions
     Approved --> Eval[(evaluation_cases)]
     Rejected --> Eval
     Approved --> Boundary{Post boundary}
-    Boundary -->|valid| Posted[posted label]
-    Boundary -->|invalid anchor or diff| Failed[postability_failure label]
+    Boundary -->|valid; replace failure| Posted[posted label]
+    Boundary -->|invalid; replace posted| Failed[postability_failure label]
     Posted --> Decisions
     Failed --> Decisions
     Posted --> Eval
@@ -290,17 +331,13 @@ flowchart TD
     Fixed -->|reopen| Issue
     Fixed -->|contract fails again| Issue
     Muted -->|contract fails again| Muted
-
-    classDef healthy fill:#17392f,stroke:#5fbf97,color:#fff;
-    classDef warn fill:#3b2f18,stroke:#e3bc3f,color:#fff;
-    classDef data fill:#2f263d,stroke:#bd93f9,color:#fff;
-    class Healthy,Approved,Posted healthy;
-    class Issue,Rejected,Failed,Muted,Fixed warn;
-    class RunStore,Decisions,Eval,Triage data;
 ```
 
 The loop is supervised. It gathers failure evidence and human labels, but does
 not edit prompts, modify code, create branches, or open pull requests.
+Human disposition and posting outcome are independent dimensions. Opposite
+labels are replaced within a dimension, preventing contradictory training
+examples without erasing the other dimension.
 
 ### Issue status lifecycle
 
@@ -337,41 +374,86 @@ Not stored:
 - model-provider error messages that could echo reviewed input;
 - API keys or GitHub tokens.
 
-## Posting flow
+## Approval and posting flow
 
 ```mermaid
 flowchart TD
-    Select[Human selects comments] --> Save[Save approval feedback]
+    Candidate[Normalized candidate] --> FrozenAnchor{Anchor exists in frozen source?}
+    FrozenAnchor -->|No| PreDrop[Reject before approval]
+    FrozenAnchor -->|Yes| FrozenDiff{Anchor matches a frozen added line?}
+    FrozenDiff -->|No| PreDrop
+    FrozenDiff -->|Yes| PreMove[Choose nearest added-line match]
+    PreMove --> UI[Show postable finding in UI]
+    UI --> Select[Human selects comments]
+    Select --> Save[Save approval feedback]
     Select --> Post[Post approved comments]
     Post --> Head{Current head equals reviewed head?}
     Head -->|No| Stale[Abort entire post as stale]
-    Head -->|Yes| Anchor{Anchor exists in source?}
+    Head -->|Yes| Anchor{Anchor exists in current source?}
     Anchor -->|No| DropAnchor[Drop invalid anchor]
     Anchor -->|Yes| Reanchor[Choose nearest added-line match]
-    Reanchor --> Diff{Line is on added side?}
+    Reanchor --> Diff{Line is on current added side?}
     Diff -->|No| DropDiff[Drop off-diff comment]
     Diff -->|Yes| Payload[Add to one review payload]
     Payload --> Submit[GitHub create_review]
     Submit --> Record[Record posted locations]
+    PreDrop --> Health[Fail finding_postability health check]
     DropAnchor --> RecordFailure[Record postability failure]
     DropDiff --> RecordFailure
-
-    classDef pass fill:#17392f,stroke:#5fbf97,color:#fff;
-    classDef fail fill:#4a2027,stroke:#f4606c,color:#fff;
-    classDef action fill:#19324d,stroke:#6cb6ff,color:#fff;
-    class Select,Save,Post,Reanchor,Payload action;
-    class Submit,Record pass;
-    class Stale,DropAnchor,DropDiff,RecordFailure fail;
 ```
+
+The first validation pass protects reviewer attention and supplies health
+evidence. The second protects GitHub from stale approvals and remote changes.
+Only the second pass can create a review or produce `posted`/
+`postability_failure` outcome labels.
+
+## Concurrent sessions and deployment
+
+Each review owns an isolated graph, checkpoint, VFS, and budget middleware.
+Multiple Streamlit sessions can run concurrently without sharing agent state.
+Repository counters use an atomic SQLite `BEGIN IMMEDIATE` increment with WAL
+mode and a 30-second busy timeout, preventing the lost-update behavior of the
+legacy JSON store. The legacy records are imported once when the new database
+is empty.
+
+The improvement database is separate and persists run health, recurring issue
+fingerprints, feedback, and sanitized evaluation cases. If a reviewer changes a
+decision, the old opposite label is deleted before the new label is inserted.
+Posting outcomes follow the same replacement rule.
+
+Run from a checkout after editable installation:
+
+```bash
+.venv/bin/quorum-review
+```
+
+The same command is installed by the wheel. It finds packaged `app.py` and
+skills under `share/quorum`, so the working directory does not need to be the
+repository. `QUORUM_SKILLS_DIR` is reserved for deliberate custom skill
+installations.
+
+For deployment, keep all Streamlit instances that share SQLite on one durable
+writer volume. For multi-host horizontal scaling, replace `FileBackedStore` and
+`ImprovementStore` with adapters for a managed transactional database. Do not
+place independent SQLite files on each host: counters, issue status, and
+feedback would diverge.
+
+The CI workflow validates Python 3.11–3.13, Ruff, branch-aware coverage,
+offline finding evaluation, wheel/sdist construction, installed resource
+discovery, and dependency vulnerabilities. See the
+[architecture quality-gate flow](../ARCHITECTURE.md#packaging-and-quality-gates)
+and [evaluation guide](../evals/README.md).
 
 ## UI screenshots
 
 Captured from a live run against the public sandbox pull request
 `chatkausik/Evidensia.AI#7` at a 1600x1000 viewport, Economy profile, Anthropic
 provider. The Streamlit developer toolbar is hidden in these captures; nothing
-else is edited. `ui-empty.png` in the repository root is a historical capture
-that predates the **Improve** tab -- treat it as a layout relic, not as
-evidence of the current runtime.
+else is edited. The Improve captures predate the addition of
+`diff_availability` and `finding_postability`, so their visible totals show 13
+rather than the current 15 checks. They document layout and issue interaction,
+not the current contract count. `ui-empty.png` in the repository root is an
+older layout relic that predates the **Improve** tab.
 
 ### Empty state
 
@@ -406,8 +488,9 @@ colour-coded suggested fix.
 
 ### Improve tab -- health contract
 
-Thirteen deterministic checks run against trusted state, never against model
-claims. Read this before treating a low finding count as a clean result.
+Fifteen deterministic checks run against trusted state, never against model
+claims. Read this before treating a low finding count as a clean result. The
+historical capture below shows the earlier 13-check version as noted above.
 
 ![Quorum improve tab health contract](images/quorum-improve.png)
 
@@ -446,15 +529,17 @@ creating documentation screenshots.
 
 Before a review:
 
-1. Confirm the UI shows `anthropic` and the intended cost profile.
+1. Confirm the UI shows the intended provider, cost profile, and model routing.
 2. Verify the PR head is stable and the GitHub token can read it.
 3. Confirm the cost and call ceilings in the sidebar.
-4. Decide whether documentation files should be included.
+4. Confirm file/aggregate limits are suitable for the PR or plan to split it.
+5. Decide whether documentation files should be included.
 
 After a review:
 
 1. Check the **Improve** tab before treating zero findings as a clean result.
-2. Inspect any failed coverage, artifact, anchor, budget, or completion check.
+2. Inspect any failed coverage, diff, artifact, anchor, postability, budget, or
+   completion check.
 3. Review low-confidence findings individually.
 4. Save approval feedback even when all findings are rejected.
 5. Post only after confirming the reviewed head SHA in the summary.
@@ -467,3 +552,13 @@ For recurring failures:
 3. Add or update a deterministic test before changing prompts or agent logic.
 4. Mark the issue fixed only after the health contract passes on a new run.
 5. Mute only expected exceptions; a recurrence of a fixed issue reopens it.
+
+Before a release:
+
+1. Run Ruff, the coverage-enabled test suite, and the offline evaluation gates.
+2. Build both wheel and source distribution.
+3. Install the wheel outside the checkout and verify `quorum-review` can find
+   `app.py` and all five skills.
+4. Run `pip-audit` with current advisory data.
+5. Review configuration, tracing retention, shared-volume, and database plans
+   for the deployment environment.

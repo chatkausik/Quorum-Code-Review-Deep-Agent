@@ -9,6 +9,7 @@ import pytest
 from quorum.models import ReviewComment
 from quorum.tools.github_tools import (
     ChangedFile,
+    ReviewLimitError,
     StaleReviewError,
     added_lines_by_path,
     is_safe_repo_path,
@@ -17,6 +18,7 @@ from quorum.tools.github_tools import (
     post_approved_review,
     re_anchor,
     should_skip,
+    validate_frozen_candidates,
 )
 
 FILE_LINES = [
@@ -78,6 +80,49 @@ class TestReAnchor:
         result, moved = re_anchor(comment, [])
         assert not moved
         assert result.line == 4
+
+
+class TestPreApprovalValidation:
+    @staticmethod
+    def _file(patch: str | None = None) -> ChangedFile:
+        return ChangedFile(
+            path="app.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            patch=(
+                '@@ -3,2 +3,3 @@\n def connect():\n+    password = "hunter2"\n'
+                "     return password"
+                if patch is None
+                else patch
+            ),
+            content="\n".join(FILE_LINES) + "\n",
+        )
+
+    def test_postable_candidate_is_reanchored_before_approval(self):
+        result = validate_frozen_candidates([self._file()], [make_comment(line=1)])
+
+        assert [comment.line for comment in result.comments] == [4]
+        assert result.re_anchored == ["app.py: line 1 -> 4"]
+        assert not result.invalid_anchors
+        assert not result.off_diff
+
+    def test_unchanged_anchor_is_rejected_before_approval(self):
+        result = validate_frozen_candidates(
+            [self._file()], [make_comment(line=5, anchor_text="    return password")]
+        )
+
+        assert result.comments == []
+        assert len(result.off_diff) == 1
+
+    def test_missing_anchor_and_patch_are_reported(self):
+        result = validate_frozen_candidates(
+            [self._file(patch="")], [make_comment(anchor_text="not in the file")]
+        )
+
+        assert result.comments == []
+        assert len(result.invalid_anchors) == 1
+        assert result.missing_patches == ["app.py"]
 
 
 PATCH = """@@ -1,4 +1,6 @@
@@ -281,6 +326,73 @@ class TestScopedGitHubTools:
 
         assert skipped == []
         assert files[0].content == "print('frozen')\n"
+
+    def test_review_file_limit_fails_instead_of_silently_reviewing_a_subset(
+        self, monkeypatch
+    ):
+        import quorum.tools.github_tools as github_tools
+        from quorum.models import ReviewContext
+
+        context = ReviewContext(
+            owner="acme", repo="widgets", pr_number=7, title="Title", body="Body",
+            head_sha="abc123", base_sha="def456", author="dev",
+        )
+        items = [
+            SimpleNamespace(
+                filename=f"src/{name}.py", status="modified", additions=1,
+                deletions=0, patch="@@ -0,0 +1 @@\n+x=1", previous_filename=None,
+            )
+            for name in ("a", "b")
+        ]
+        pull = SimpleNamespace(
+            head=SimpleNamespace(sha="abc123"), get_files=lambda: items
+        )
+
+        class Repo:
+            def get_pull(self, _number):
+                return pull
+
+            def get_contents(self, _path, ref):
+                assert ref == "abc123"
+                return SimpleNamespace(decoded_content=b"x=1\n")
+
+        monkeypatch.setattr(
+            github_tools, "_client", lambda: SimpleNamespace(get_repo=lambda _full: Repo())
+        )
+
+        with pytest.raises(ReviewLimitError, match="No partial review"):
+            load_changed_files(context, max_files=1)
+
+    def test_aggregate_source_limit_fails_before_the_agent_runs(self, monkeypatch):
+        import quorum.tools.github_tools as github_tools
+        from quorum.models import ReviewContext
+
+        context = ReviewContext(
+            owner="acme", repo="widgets", pr_number=7, title="Title", body="Body",
+            head_sha="abc123", base_sha="def456", author="dev",
+        )
+        item = SimpleNamespace(
+            filename="src/app.py", status="modified", additions=1, deletions=0,
+            patch="@@ -0,0 +1 @@\n+x=1", previous_filename=None,
+        )
+        pull = SimpleNamespace(
+            head=SimpleNamespace(sha="abc123"), get_files=lambda: [item]
+        )
+
+        class Repo:
+            def get_pull(self, _number):
+                return pull
+
+            def get_contents(self, _path, ref):
+                assert ref == "abc123"
+                return SimpleNamespace(decoded_content=b"0123456789")
+
+        monkeypatch.setattr(
+            github_tools, "_client", lambda: SimpleNamespace(get_repo=lambda _full: Repo())
+        )
+
+        with pytest.raises(ReviewLimitError, match="character review limit"):
+            load_changed_files(context, max_total_chars=5)
 
     @pytest.mark.parametrize(
         "path,expected",

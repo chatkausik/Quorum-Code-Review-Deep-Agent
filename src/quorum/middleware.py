@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from threading import Lock
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
@@ -86,6 +87,8 @@ class CostTrackingMiddleware(AgentMiddleware):
         self.output_tokens = 0
         self.cache_read_tokens = 0
         self.cache_write_tokens = 0
+        self._inflight = 0
+        self._lock = Lock()
         self.log: list[str] = []
         # Per-model rollup, so the UI can show where the budget actually went.
         self.by_model: dict[str, dict[str, float]] = defaultdict(
@@ -93,14 +96,16 @@ class CostTrackingMiddleware(AgentMiddleware):
         )
 
     def reset(self) -> None:
-        self.total_cost_usd = 0.0
-        self.calls = 0
-        self.input_tokens = 0
-        self.output_tokens = 0
-        self.cache_read_tokens = 0
-        self.cache_write_tokens = 0
-        self.log = []
-        self.by_model.clear()
+        with self._lock:
+            self.total_cost_usd = 0.0
+            self.calls = 0
+            self.input_tokens = 0
+            self.output_tokens = 0
+            self.cache_read_tokens = 0
+            self.cache_write_tokens = 0
+            self._inflight = 0
+            self.log = []
+            self.by_model.clear()
 
     @staticmethod
     def price_for(model_name: str | None) -> tuple[float, float]:
@@ -145,63 +150,95 @@ class CostTrackingMiddleware(AgentMiddleware):
             + (output_tokens / 1_000_000) * out_price
         )
 
-        self.calls += 1
-        self.input_tokens += input_tokens
-        self.output_tokens += output_tokens
-        self.cache_read_tokens += cache_read
-        self.cache_write_tokens += cache_write
-        self.total_cost_usd += cost
+        with self._lock:
+            # Runtime calls are reserved by before_model so the (max_calls + 1)th
+            # request never reaches a provider. Direct record() use, including
+            # tests and adapters without before_model, still counts normally.
+            if self._inflight:
+                self._inflight -= 1
+            else:
+                self.calls += 1
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            self.cache_read_tokens += cache_read
+            self.cache_write_tokens += cache_write
+            self.total_cost_usd += cost
 
-        bucket = self.by_model[model_name or "unknown"]
-        bucket["calls"] += 1
-        bucket["cost"] += cost
-        bucket["input"] += input_tokens
-        bucket["output"] += output_tokens
-        bucket["cached"] += cache_read
+            bucket = self.by_model[model_name or "unknown"]
+            bucket["calls"] += 1
+            bucket["cost"] += cost
+            bucket["input"] += input_tokens
+            bucket["output"] += output_tokens
+            bucket["cached"] += cache_read
 
-        entry = (
-            f"call {self.calls}: {model_name or 'unknown'} "
-            f"in={input_tokens} (uncached={uncached} "
-            f"cache_read={cache_read} cache_write={cache_write}) "
-            f"out={output_tokens} "
-            f"cost=${cost:.4f} cumulative=${self.total_cost_usd:.4f}"
-        )
-        self.log.append(entry)
-        logger.info(entry)
-
-        if self.total_cost_usd > self.max_cost_usd:
-            raise BudgetExceeded(
-                f"Cost ceiling exceeded: ${self.total_cost_usd:.4f} > "
-                f"${self.max_cost_usd:.2f} after {self.calls} calls. Run halted."
+            entry = (
+                f"call {self.calls}: {model_name or 'unknown'} "
+                f"in={input_tokens} (uncached={uncached} "
+                f"cache_read={cache_read} cache_write={cache_write}) "
+                f"out={output_tokens} "
+                f"cost=${cost:.4f} cumulative=${self.total_cost_usd:.4f}"
             )
-        if self.calls > self.max_calls:
-            raise BudgetExceeded(
-                f"Call ceiling exceeded: {self.calls} > {self.max_calls}. Run halted."
-            )
+            self.log.append(entry)
+            logger.info(entry)
+
+            if self.total_cost_usd > self.max_cost_usd:
+                raise BudgetExceeded(
+                    f"Cost stop threshold exceeded: ${self.total_cost_usd:.4f} > "
+                    f"${self.max_cost_usd:.2f} after {self.calls} calls. Run halted."
+                )
+            if self.calls > self.max_calls:
+                raise BudgetExceeded(
+                    f"Call ceiling exceeded: {self.calls} > {self.max_calls}. Run halted."
+                )
+
+    def before_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ARG002
+        """Reserve a provider call before it starts.
+
+        Cost can only be known after a provider responds, but call count can be
+        enforced exactly. The lock also protects a shared middleware instance
+        when separate subagent graphs execute concurrently.
+        """
+        with self._lock:
+            if self.calls >= self.max_calls:
+                raise BudgetExceeded(
+                    f"Call ceiling reached: {self.calls} >= {self.max_calls}. "
+                    "No additional model call was started."
+                )
+            if self.total_cost_usd >= self.max_cost_usd:
+                raise BudgetExceeded(
+                    f"Cost stop threshold reached: ${self.total_cost_usd:.4f} >= "
+                    f"${self.max_cost_usd:.2f}. No additional model call was started."
+                )
+            self.calls += 1
+            self._inflight += 1
+        return None
 
     def snapshot(self) -> dict[str, Any]:
         """Current totals, for live display."""
-        cached_share = (
-            self.cache_read_tokens / self.input_tokens if self.input_tokens else 0.0
-        )
-        return {
-            "calls": self.calls,
-            "cost": round(self.total_cost_usd, 4),
-            "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens,
-            "cache_read_tokens": self.cache_read_tokens,
-            "cached_share": round(cached_share, 3),
-            "by_model": {
-                name: {
-                    "calls": int(v["calls"]),
-                    "cost": round(v["cost"], 4),
-                    "input": int(v["input"]),
-                    "output": int(v["output"]),
-                    "cached": int(v["cached"]),
+        with self._lock:
+            cached_share = (
+                self.cache_read_tokens / self.input_tokens
+                if self.input_tokens
+                else 0.0
+            )
+            return {
+                "calls": self.calls,
+                "cost": round(self.total_cost_usd, 4),
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "cache_read_tokens": self.cache_read_tokens,
+                "cached_share": round(cached_share, 3),
+                "by_model": {
+                    name: {
+                        "calls": int(v["calls"]),
+                        "cost": round(v["cost"], 4),
+                        "input": int(v["input"]),
+                        "output": int(v["output"]),
+                        "cached": int(v["cached"]),
+                    }
+                    for name, v in self.by_model.items()
                 }
-                for name, v in self.by_model.items()
-            },
-        }
+            }
 
     def after_model(self, state, runtime) -> dict[str, Any] | None:  # noqa: ARG002
         messages = state.get("messages") or []

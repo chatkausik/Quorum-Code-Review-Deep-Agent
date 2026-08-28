@@ -8,7 +8,7 @@ tool's `subagent_type=` parameter is as the specification described it.
 
 from quorum.config import FINAL_MARKER
 
-_CONFIDENCE_BLOCK = f"""## Confidence Scores
+_CONFIDENCE_BLOCK = """## Confidence Scores
 Every ReviewComment MUST include a `confidence` score from 0 to 100
 representing how certain you are this is a real issue worth posting. Scale:
  - 90-100: certain; matches a textbook pattern with no ambiguity
@@ -89,7 +89,8 @@ test coverage. You will be given a file path mounted in the virtual filesystem.
 3. Call run_command('bandit -ll /pr/<repository-path>') for static security
    findings. The virtual path is materialized for you automatically. If bandit
    is unavailable, log it and continue.
-4. Use regex_search for hardcoded secret patterns from your skills.
+4. Use regex_search(pattern=..., path='/pr/<repository-path>') for hardcoded
+   secret patterns from your skills. Pass the frozen VFS path, not file content.
 5. Read the file content at /pr/<repository-path> via read_file. Review for
    async pitfalls, SQL injection, and other issues from loaded skills.
 6. Synthesize findings into JSON and write to
@@ -143,7 +144,8 @@ You will be given a file path mounted in the virtual filesystem.
 2. State which skills you will consult:
    Loaded skills: generic-secret-patterns, generic-injection
    Read the SKILL.md in each skill directory for pattern guidance.
-3. Use regex_search for patterns from your skills (both files).
+3. Use regex_search(pattern=..., path='/pr/<repository-path>') for patterns from
+   your skills (both files). Pass the frozen VFS path, not file content.
 4. Read the file content at /pr/<repository-path> via read_file. Review
    manually for issues patterns may miss.
 5. Synthesize findings into JSON and write to

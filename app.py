@@ -39,10 +39,6 @@ from quorum.tools.github_tools import (
 )
 from quorum.ui_theme import (
     CATEGORY_META,
-    feed,
-    meters,
-    model_table,
-    phase_strip,
     CLEAN_IMAGE,
     CSS,
     EMPTY_IMAGE,
@@ -50,6 +46,10 @@ from quorum.ui_theme import (
     code_window,
     confidence_color,
     diff_block,
+    feed,
+    meters,
+    model_table,
+    phase_strip,
     severity_style,
 )
 
@@ -379,7 +379,7 @@ with st.sidebar:
     if langsmith_enabled():
         link = project_url()
         st.markdown(
-            f"🔬 **LangSmith** · tracing on"
+            "🔬 **LangSmith** · tracing on"
             + (f"  \n[Open dashboard →]({link})" if link else "")
         )
     else:
@@ -491,6 +491,13 @@ else:
         st.error(result.error)
     elif result.budget_exceeded:
         st.warning(f"{result.error} Findings below may be incomplete.")
+
+    failed_health_checks = [check for check in result.health_checks if not check.passed]
+    if failed_health_checks:
+        st.warning(
+            f"{len(failed_health_checks)} deterministic review-health check(s) failed. "
+            "Open the Improve tab before treating this run as complete."
+        )
 
     stat_tiles(
         [

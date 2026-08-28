@@ -17,22 +17,22 @@ from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend
-from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.language_models import BaseChatModel
+from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
 
 from quorum.backends import ReadOnlyFilesystemBackend, ReviewStateBackend
 from quorum.config import (
     CONFIDENCE_THRESHOLD,
-    MAX_OUTPUT_TOKENS,
-    MODEL_PROVIDER,
-    provider_api_key,
-    resolve_review_settings,
     FINAL_MARKER,
     FINDINGS_DIR,
+    MAX_OUTPUT_TOKENS,
+    MODEL_PROVIDER,
     SKILLS_DIR,
     SKILLS_MOUNT,
     ReviewSettings,
+    provider_api_key,
+    resolve_review_settings,
 )
 from quorum.evaluation import evaluate_run_health
 from quorum.improvement import ImprovementStore
@@ -54,9 +54,10 @@ from quorum.tools.github_tools import (
     load_changed_files,
     load_pr_context,
     make_pr_tools,
+    validate_frozen_candidates,
 )
 from quorum.tools.sandbox import make_run_command
-from quorum.tools.search_tools import regex_search
+from quorum.tools.search_tools import make_regex_search
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,11 @@ def build_backend() -> CompositeBackend:
     written to the host filesystem. /skills is mounted read-only from the repo
     so a security team can edit a pattern without a redeploy.
     """
+    if not SKILLS_DIR.is_dir():
+        raise RuntimeError(
+            f"Quorum skills were not installed at {SKILLS_DIR}. Reinstall the package "
+            "or set QUORUM_SKILLS_DIR to the directory containing the skill folders."
+        )
     return CompositeBackend(
         default=ReviewStateBackend(),
         routes={
@@ -156,6 +162,7 @@ def build_agent(
 
     backend = build_backend()
     run_command = make_run_command(backend)
+    regex_search = make_regex_search(backend)
 
     # One shared instance: subagents are separately compiled graphs, so a
     # ceiling attached only to the orchestrator would not bound the run.
@@ -582,10 +589,14 @@ def run_review(
     settings = resolve_review_settings(profile)
     context = load_pr_context(owner, repo, pr_number)
     changed_files, skipped_files = load_changed_files(
-        context, review_docs=settings.review_docs
+        context,
+        review_docs=settings.review_docs,
+        max_files=settings.max_review_files,
+        max_total_chars=settings.max_total_source_chars,
     )
     expected_paths = {item.path for item in changed_files}
     expected_content = {item.path: item.content for item in changed_files}
+    expected_patches = {item.path: item.patch for item in changed_files}
     run_id = f"review-{uuid.uuid4().hex[:16]}"
     history = store.get_stats(owner, repo)
 
@@ -765,6 +776,15 @@ def run_review(
             "Recovered %d finding(s) the consolidation step omitted", recovered_count
         )
 
+    # Validate against the same frozen source and patch the model reviewed.
+    # The GitHub post boundary repeats this against current remote state, but a
+    # finding already known to be unpostable should never ask for human approval.
+    postability = validate_frozen_candidates(changed_files, comments)
+    if postability.invalid_anchors:
+        dropped["invalid anchor"] += len(postability.invalid_anchors)
+    if postability.off_diff:
+        dropped["off added diff"] += len(postability.off_diff)
+    comments = merge_findings(postability.comments, dropped)
     comments.sort(key=lambda c: c.sort_key())
     emit({
         "type": "log",
@@ -773,7 +793,7 @@ def run_review(
         "text": "Consolidated candidate findings",
         "detail": (
             f"{len(comments)} retained · {sum(dropped.values())} filtered · "
-            f"{recovered_count} recovered"
+            f"{recovered_count} recovered · {len(postability.re_anchored)} re-anchored"
         ),
     })
 
@@ -789,6 +809,11 @@ def run_review(
     health_checks = evaluate_run_health(
         expected_paths=expected_paths,
         expected_content=expected_content,
+        expected_patches=expected_patches,
+        postability_failures={
+            "invalid_anchor": postability.invalid_anchors,
+            "off_diff": postability.off_diff,
+        },
         comments=comments,
         state=state,
         error=error,
@@ -814,7 +839,13 @@ def run_review(
         llm_calls=cost.calls,
         budget_exceeded=budget_exceeded,
         error=error,
-        trace=_trace(state) + cost.log if state else cost.log,
+        trace=(
+            (_trace(state) if state else [])
+            + [f"pre-approval re-anchor: {entry}" for entry in postability.re_anchored]
+            + [f"pre-approval rejected: {entry}" for entry in postability.invalid_anchors]
+            + [f"pre-approval rejected: {entry}" for entry in postability.off_diff]
+            + cost.log
+        ),
         dropped=dict(dropped),
         subagent_reported=_count_subagent_findings(state) if state else 0,
         trace_url=trace.get("url"),

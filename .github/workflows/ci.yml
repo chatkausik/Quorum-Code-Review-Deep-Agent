@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install project and development tools
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Test with branch coverage
+        run: python -m pytest --cov=quorum --cov-report=term-missing
+      - name: Run offline evaluation fixture
+        run: >-
+          quorum-eval evals/fixtures/expected.json evals/fixtures/actual.json
+          --min-precision 1 --min-recall 1 --min-f1 1
+          --min-anchor-accuracy 1
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Smoke-test wheel resources
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          cd /tmp
+          python -c "from quorum.cli import app_path; from quorum.config import SKILLS_DIR; assert app_path().is_file(); assert (SKILLS_DIR / 'python-sql-injection' / 'SKILL.md').is_file()"
+      - name: Audit installed dependencies
+        run: pip-audit

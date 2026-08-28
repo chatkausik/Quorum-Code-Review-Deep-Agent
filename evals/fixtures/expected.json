@@ -1,0 +1,16 @@
+{
+  "expected": [
+    {
+      "path": "src/db.py",
+      "line": 10,
+      "category": "security",
+      "anchor_text": "cursor.execute(f\"SELECT * FROM users WHERE id = {uid}\")"
+    },
+    {
+      "path": "src/service.py",
+      "line": 24,
+      "category": "correctness",
+      "anchor_text": "result = blocking_call()"
+    }
+  ]
+}

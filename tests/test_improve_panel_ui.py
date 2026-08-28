@@ -10,10 +10,11 @@ from pathlib import Path
 
 import pytest
 
-APP = Path(__file__).resolve().parents[1] / "app.py"
-
 from quorum.improvement import ImprovementStore
+from quorum.memory import FileBackedStore
 from quorum.models import HealthCheck, ReviewComment, ReviewContext, ReviewResult
+
+APP = Path(__file__).resolve().parents[1] / "app.py"
 
 AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
 
@@ -44,6 +45,7 @@ def _app(tmp_path):
     store.record_review(result)
 
     app = AppTest.from_file(str(APP), default_timeout=60)
+    app.session_state["store"] = FileBackedStore(tmp_path / "stats")
     app.session_state["improvement_store"] = store
     app.session_state["result"] = result
     return app.run(), store

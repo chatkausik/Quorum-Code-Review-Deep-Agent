@@ -8,25 +8,62 @@ version = "0.1.0"
 description = "Quorum — a deep-agents orchestrator that reviews GitHub pull requests for correctness, security, and test-coverage issues"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
 dependencies = [
   "deepagents>=0.7.9,<0.8",
   "langchain-openai>=1.6,<2",
-  "langchain-anthropic>=1.6.1",
-  "PyGithub>=2.5",
-  "unidiff>=0.7.5",
-  "streamlit>=1.40",
-  "python-dotenv>=1.0",
-  "bandit>=1.8",
+  "langchain-anthropic>=1.6.1,<2",
+  "langchain-core>=1.6,<2",
+  "langgraph>=1.2,<2",
+  "pydantic>=2.10,<3",
+  "PyGithub>=2.5,<3",
+  "unidiff>=0.7.5,<2",
+  "streamlit>=1.40,<2",
+  "python-dotenv>=1.0,<2",
+  "bandit>=1.8,<2",
   "regex>=2024.11",
 ]
 
+[project.scripts]
+quorum-review = "quorum.cli:main"
+quorum-eval = "quorum.evals:main"
+
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = [
+  "build>=1.2,<2",
+  "pip-audit>=2.7,<3",
+  "pytest>=8,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.11,<1",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.data-files]
+"share/quorum" = ["app.py"]
+"share/quorum/skills/generic-injection" = ["skills/generic-injection/SKILL.md"]
+"share/quorum/skills/generic-secret-patterns" = ["skills/generic-secret-patterns/SKILL.md"]
+"share/quorum/skills/python-async-pitfalls" = ["skills/python-async-pitfalls/SKILL.md"]
+"share/quorum/skills/python-secret-patterns" = ["skills/python-secret-patterns/SKILL.md"]
+"share/quorum/skills/python-sql-injection" = ["skills/python-sql-injection/SKILL.md"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.coverage.run]
+branch = true
+source = ["quorum"]
+
+[tool.coverage.report]
+fail_under = 65
+show_missing = true

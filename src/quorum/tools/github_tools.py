@@ -18,7 +18,12 @@ from langchain.tools import tool
 from langchain_core.tools import BaseTool
 from unidiff import PatchSet
 
-from quorum.config import REVIEW_DOCS, github_token
+from quorum.config import (
+    MAX_REVIEW_FILES,
+    MAX_TOTAL_SOURCE_CHARS,
+    REVIEW_DOCS,
+    github_token,
+)
 from quorum.models import PostResult, ReviewComment, ReviewContext
 
 # Paths whose diffs are noise for a reviewer: generated, vendored, or minified.
@@ -51,6 +56,10 @@ class UnsupportedReviewFile(ValueError):
     """Raised for changed content that cannot be reviewed as UTF-8 text."""
 
 
+class ReviewLimitError(RuntimeError):
+    """Raised instead of silently performing a partial oversized review."""
+
+
 @dataclass(frozen=True)
 class ChangedFile:
     path: str
@@ -61,6 +70,7 @@ class ChangedFile:
     # Trusted content frozen at the same head SHA as the manifest. It is not
     # returned by list_files because the agent reads it from the preloaded VFS.
     content: str = ""
+    previous_path: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -185,7 +195,11 @@ def load_pr_context(owner: str, repo: str, pr_number: int) -> ReviewContext:
 
 
 def load_changed_files(
-    context: ReviewContext, *, review_docs: bool = False
+    context: ReviewContext,
+    *,
+    review_docs: bool = False,
+    max_files: int = MAX_REVIEW_FILES,
+    max_total_chars: int = MAX_TOTAL_SOURCE_CHARS,
 ) -> tuple[list[ChangedFile], list[str]]:
     """Fetch and freeze the eligible file manifest for one reviewed head SHA."""
     pull = _client().get_repo(context.full_repo).get_pull(context.pr_number)
@@ -197,6 +211,7 @@ def load_changed_files(
 
     files: list[ChangedFile] = []
     skipped: list[str] = []
+    total_chars = 0
     for item in pull.get_files():
         if (
             item.status == "removed"
@@ -205,6 +220,11 @@ def load_changed_files(
         ):
             skipped.append(item.filename)
             continue
+        if len(files) >= max_files:
+            raise ReviewLimitError(
+                f"This pull request has more than {max_files} eligible files. "
+                "No partial review was started. Raise REVIEW_MAX_FILES or split the PR."
+            )
         try:
             content = _load_file_content(
                 context.full_repo, item.filename, context.head_sha
@@ -212,6 +232,13 @@ def load_changed_files(
         except UnsupportedReviewFile:
             skipped.append(item.filename)
             continue
+        if total_chars + len(content) > max_total_chars:
+            raise ReviewLimitError(
+                f"Eligible source exceeds the {max_total_chars:,}-character review limit "
+                f"at {item.filename!r}. No partial review was started. Raise "
+                "REVIEW_MAX_TOTAL_CHARS or split the PR."
+            )
+        total_chars += len(content)
         files.append(
             ChangedFile(
                 path=item.filename,
@@ -220,6 +247,7 @@ def load_changed_files(
                 deletions=item.deletions,
                 patch=item.patch or "",
                 content=content,
+                previous_path=getattr(item, "previous_filename", None),
             )
         )
     return files, skipped
@@ -385,29 +413,105 @@ def get_file_lines(full_repo: str, path: str, ref: str) -> tuple[str, ...]:
 # --------------------------------------------------------------------------
 
 
+def _added_lines(
+    filename: str, previous_filename: str | None, patch_text: str | None
+) -> set[int]:
+    """Parse added line numbers from one GitHub bare patch body."""
+    if not patch_text:
+        return set()
+    header = (
+        f"--- a/{previous_filename or filename}\n"
+        f"+++ b/{filename}\n"
+    )
+    try:
+        patch = PatchSet(header + patch_text)
+    except Exception:  # noqa: BLE001 - malformed evidence becomes non-postable
+        return set()
+    return {
+        line.target_line_no
+        for patched_file in patch
+        for hunk in patched_file
+        for line in hunk
+        if line.is_added and line.target_line_no is not None
+    }
+
+
 def added_lines_by_path(pull) -> dict[str, set[int]]:
-    """Map each changed file to the set of line numbers on the '+' side of its diff."""
-    added: dict[str, set[int]] = {}
-    for item in pull.get_files():
-        if not item.patch:
-            continue
-        # unidiff needs a file header to parse a bare patch body.
-        header = (
-            f"--- a/{item.previous_filename or item.filename}\n"
-            f"+++ b/{item.filename}\n"
+    """Map each changed file to line numbers on the '+' side of its current diff."""
+    return {
+        item.filename: _added_lines(
+            item.filename, item.previous_filename, item.patch
         )
-        try:
-            patch = PatchSet(header + item.patch)
-        except Exception:  # noqa: BLE001 - a malformed patch must not abort posting
+        for item in pull.get_files()
+        if item.patch
+    }
+
+
+def frozen_added_lines(changed_files: list[ChangedFile]) -> dict[str, set[int]]:
+    """Added lines from the exact patch evidence frozen before the model ran."""
+    return {
+        item.path: _added_lines(item.path, item.previous_path, item.patch)
+        for item in changed_files
+    }
+
+
+@dataclass(frozen=True)
+class CandidateValidation:
+    """Result of validating model findings against frozen source and diff evidence."""
+
+    comments: list[ReviewComment]
+    re_anchored: list[str]
+    invalid_anchors: list[str]
+    off_diff: list[str]
+    missing_patches: list[str]
+
+
+def validate_frozen_candidates(
+    changed_files: list[ChangedFile], comments: list[ReviewComment]
+) -> CandidateValidation:
+    """Re-anchor and reject non-postable findings before human approval.
+
+    The GitHub post boundary repeats these checks against current remote state;
+    this first pass keeps the UI from asking a human to approve a finding that
+    was already known to be unpostable at the reviewed head.
+    """
+    by_path = {item.path: item for item in changed_files}
+    added = frozen_added_lines(changed_files)
+    accepted: list[ReviewComment] = []
+    moved: list[str] = []
+    invalid: list[str] = []
+    off_diff: list[str] = []
+
+    for comment in comments:
+        item = by_path.get(comment.path)
+        if item is None:
+            invalid.append(f"{comment.path}:{comment.line} — file is outside the manifest")
             continue
-        lines: set[int] = set()
-        for patched_file in patch:
-            for hunk in patched_file:
-                for line in hunk:
-                    if line.is_added and line.target_line_no is not None:
-                        lines.add(line.target_line_no)
-        added[item.filename] = lines
-    return added
+        matches = anchor_line_numbers(comment, item.content.splitlines())
+        if not matches:
+            invalid.append(
+                f"{comment.path}:{comment.line} — anchor text was not found at the reviewed head"
+            )
+            continue
+        added_matches = [line for line in matches if line in added.get(comment.path, set())]
+        if not added_matches:
+            off_diff.append(
+                f"{comment.path}:{comment.line} — anchor is not on the added side"
+            )
+            continue
+        best = min(added_matches, key=lambda line: abs(line - comment.line))
+        if best != comment.line:
+            moved.append(f"{comment.path}: line {comment.line} -> {best}")
+            comment = comment.model_copy(update={"line": best})
+        accepted.append(comment)
+
+    return CandidateValidation(
+        comments=accepted,
+        re_anchored=moved,
+        invalid_anchors=invalid,
+        off_diff=off_diff,
+        missing_patches=sorted(item.path for item in changed_files if not item.patch),
+    )
 
 
 def re_anchor(

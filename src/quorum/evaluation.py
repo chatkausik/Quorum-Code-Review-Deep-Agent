@@ -25,6 +25,8 @@ def evaluate_run_health(
     *,
     expected_paths: set[str],
     expected_content: dict[str, str] | None = None,
+    expected_patches: dict[str, str] | None = None,
+    postability_failures: dict[str, list[str]] | None = None,
     comments: list[ReviewComment],
     state: dict[str, Any],
     error: str | None,
@@ -37,6 +39,9 @@ def evaluate_run_health(
     """Evaluate invariants from trusted run state, never from model claims."""
     files = state.get("files") or {}
     expected_content = expected_content or {}
+    patch_evidence_supplied = expected_patches is not None
+    expected_patches = expected_patches or {}
+    postability_failures = postability_failures or {}
     expected_vfs = {f"/pr/{path}" for path in expected_paths}
     mounted_vfs = {path for path in files if path.startswith("/pr/")}
     missing = sorted(expected_vfs - mounted_vfs)
@@ -67,6 +72,11 @@ def evaluate_run_health(
         path
         for path, content in expected_content.items()
         if content.endswith("\n... file truncated")
+    )
+    missing_patches = (
+        sorted(path for path in expected_paths if not expected_patches.get(path))
+        if patch_evidence_supplied
+        else []
     )
 
     checks = [
@@ -151,6 +161,17 @@ def evaluate_run_health(
             ),
             evidence={"truncated": truncated_sources},
         ),
+        HealthCheck(
+            name="diff_availability",
+            severity="high",
+            passed=not missing_patches,
+            detail=(
+                "Every eligible file has frozen patch evidence."
+                if not missing_patches
+                else f"{len(missing_patches)} eligible file(s) had no patch evidence."
+            ),
+            evidence={"missing": missing_patches},
+        ),
     ]
 
     unknown_findings = sorted({comment.path for comment in comments} - expected_paths)
@@ -221,6 +242,28 @@ def evaluate_run_health(
                 evidence={"misplaced": misplaced_anchors},
             ),
         ]
+    )
+
+    failed_postability = sorted(
+        entry
+        for entries in postability_failures.values()
+        for entry in entries
+    )
+    checks.append(
+        HealthCheck(
+            name="finding_postability",
+            severity="high",
+            passed=not failed_postability,
+            detail=(
+                "Every retained candidate was postable on the frozen added-side diff."
+                if not failed_postability
+                else f"{len(failed_postability)} candidate finding(s) were rejected before approval."
+            ),
+            evidence={
+                "invalid_anchors": postability_failures.get("invalid_anchor", []),
+                "off_diff": postability_failures.get("off_diff", []),
+            },
+        )
     )
 
     within_budget = (

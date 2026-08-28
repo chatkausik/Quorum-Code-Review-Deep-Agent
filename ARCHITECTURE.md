@@ -4,55 +4,228 @@ For the visual system flows, event-by-event runtime narrative, operator
 checklists, and UI captures, see the
 [Operations and Event Guide](docs/OPERATIONS_GUIDE.md).
 
+## Runtime architecture
+
+![Quorum end-to-end runtime architecture](docs/images/quorum-system-overview.png)
+
+The image provides the presentation view; the Mermaid diagram below is the
+maintainable component-and-authority map.
+
+```mermaid
+flowchart LR
+    subgraph Control[Deterministic control plane]
+        UI[Streamlit UI]
+        Loader[Target and evidence loader]
+        Limits{Review-size guard}
+        Frozen[(Frozen manifest, source, and patches)]
+        Normalize[Normalize, scope, and deduplicate]
+        Preapproval[Pre-approval anchor and diff validator]
+        Health[15 health contracts]
+        Gate{Human confidence gate}
+        Post[Current-head post validator]
+    end
+
+    subgraph Agents[Agentic review plane]
+        Budget[Shared locked budget middleware]
+        Orchestrator[Configured orchestrator]
+        Python[Python reviewer]
+        Generic[Generic reviewer]
+        Artifacts[(Per-file findings JSON)]
+    end
+
+    GitHub[(GitHub API)]
+    Stats[(SQLite repository counters)]
+    Improvement[(SQLite health and feedback)]
+
+    UI --> Loader
+    GitHub --> Loader
+    Loader --> Limits
+    Limits -->|accepted| Frozen
+    Limits -->|too large| UI
+    Frozen --> Orchestrator
+    Budget --> Orchestrator
+    Budget --> Python
+    Budget --> Generic
+    Orchestrator --> Python
+    Orchestrator --> Generic
+    Python --> Artifacts
+    Generic --> Artifacts
+    Artifacts --> Normalize
+    Normalize --> Preapproval
+    Frozen --> Preapproval
+    Preapproval --> Health
+    Frozen --> Health
+    Health --> UI
+    Health --> Improvement
+    UI --> Gate
+    Gate -->|approved only| Post
+    Post --> GitHub
+    Gate --> Improvement
+    Post --> Improvement
+    UI <--> Stats
+```
+
+Arrows crossing out of the agentic plane carry findings or usage telemetry,
+not authority. Models cannot select a different target, change frozen evidence,
+write persistent stores, or reach the GitHub posting API.
+
 ## Component reference
 
 | Component | Type | LLM calls | Responsibility |
 | --- | --- | --- | --- |
 | `app.py` | Streamlit entry point | 0 | Collects owner/repo/PR, buckets findings by confidence, renders Approve/Reject, calls `post_approved_review`. |
 | Trusted review loader | Deterministic Python | 0 | Freezes PR metadata, head SHA, eligible manifest, source, and patches before the graph starts. |
+| Review-size guard | Deterministic Python | 0 | Refuses a run before model execution if eligible file count or aggregate source characters exceed configured limits. |
 | Review orchestrator | Deep agent (loop) | variable | Built by `create_deep_agent`. Inspects the frozen VFS, decides per file whether to delegate, consolidates findings, emits `FINAL_FINDINGS_JSON`. |
 | `python_reviewer` | Subagent | variable | Spawned via `task` for `.py` files. Loads three Python skills, runs bandit in the sandbox, writes `/findings/<repository-path>.json`. |
 | `generic_reviewer` | Subagent | variable | Spawned for non-Python files. Loads two generic skills. No bandit — it is Python-only. |
 | `PRMetadataMiddleware` | `wrap_model_call` hook | 0 | Reasserts the human-selected repository, PR number, and SHAs on every call. Untrusted title/body are available only through a bound tool. |
-| `CostTrackingMiddleware` | `after_model` hook | 0 | Logs tokens per call; raises past $1.00 or 25 calls. |
-| Tools | Bound `@tool` functions | 0 | Frozen-target `fetch_pr`, `list_files`, and `get_file_content`; `regex_search`; constrained `run_command`. No target parameters or posting tool are exposed to the model. |
+| `CostTrackingMiddleware` | `before_model` + `after_model` hooks | 0 | Reserves calls before execution, logs token cost after responses, and stops the shared run at its configured thresholds. |
+| Tools | Bound `@tool` functions | 0 | Frozen-target `fetch_pr`, `list_files`, `get_file_content`, and path-bound `regex_search`; constrained `run_command`. No target parameters or posting tool are exposed to the model. |
 | Skills | Markdown | 0 | Pattern knowledge loaded on demand from `/skills/<name>/SKILL.md`. |
 | Virtual filesystem | `ReviewStateBackend` | 0 | Preloaded `/pr/` and `/patches/` evidence is immutable. Agents can mutate only safe `/findings/**/*.json` paths. |
-| `FileBackedStore` | Persistent store | 0 | Per-repo statistics under `~/.quorum_memory/`. |
+| `FileBackedStore` | Persistent store | 0 | Transactional per-repo statistics in SQLite under `~/.quorum_memory/`; imports the legacy JSON format once. |
 | `ImprovementStore` | SQLite | 0 | Run health, deduplicated recurring issues, human decisions, and sanitized evaluation cases. |
-| Health evaluator | Deterministic Python | 0 | Checks source integrity, per-file artifacts, finding paths/anchors/lines, completion, truncation, and budget. |
+| Frozen-candidate validator | Deterministic Python | 0 | Re-anchors candidates against frozen source and rejects missing anchors or lines outside the frozen added-side diff before approval. |
+| Health evaluator | Deterministic Python | 0 | Checks source/diff integrity, per-file artifacts, finding paths/anchors/lines/postability, completion, truncation, and budget. |
 | Confidence gate | UI logic | 0 | Auto-approve at/above threshold; manual decision below. |
 | `post_approved_review` | Deterministic Python | 0 | Re-anchor → unidiff validate → one `create_review` call. |
+| `quorum-eval` | Offline CLI | 0 | Scores exact path/line/category identity plus anchor accuracy and enforces precision, recall, F1, and anchor thresholds. |
+| `quorum-review` | Installed CLI | 0 | Resolves the source or packaged Streamlit entry point and launches the UI with bundled skill resources. |
 
 Total LLM calls per run is variable — the orchestrator chooses how many files
-to delegate, and each subagent runs its own loop. The hard ceiling is 25 calls
-or $1.00, whichever comes first.
+to delegate, and each subagent runs its own loop. The call ceiling is exact:
+call 26 is never started when the limit is 25. Dollar cost is only known after
+a provider responds, so the configured amount is a post-response stop threshold.
 
 ## Data flow
 
 1. `run_review` fetches PR metadata and freezes the eligible manifest at one
-   head SHA. It fetches source deterministically and preloads `/pr/<path>` plus
-   `/patches/<path>.patch` before the model runs.
-2. The orchestrator can list only that frozen target and reads immutable source
+   head SHA. While loading source, it enforces the file-count and aggregate
+   character limits; an oversized review fails rather than becoming partial.
+2. Trusted Python preloads `/pr/<path>` plus `/patches/<path>.patch` before the
+   model runs.
+3. The orchestrator can list only that frozen target and reads immutable source
    from the VFS. Trusted historical counters are included as integers; no model
    tool can read or write persistent memory.
-3. Per file, it delegates via
+4. Per file, it delegates via
    `task(subagent_type="python_reviewer" | "generic_reviewer")`.
    The subagent reads from `/pr/<name>` and writes `/findings/<name>.json`.
    Source remains ephemeral graph state and is never copied into persistent
    memory or improvement records.
-4. The orchestrator reads the findings files back. Deterministic Python filters
+5. The orchestrator reads the findings files back. Deterministic Python filters
    out-of-manifest paths, drops `low`, and deduplicates by `(path, line)` while
    retaining the strongest candidate.
-5. The health evaluator compares final state with the frozen inputs. Run data
-   and recurring failures are persisted in SQLite without source or finding
-   prose.
-6. The UI buckets by confidence; the human approves or rejects and can save
-   those decisions as evaluation labels without posting.
-7. `post_approved_review` verifies the head SHA is still current, requires a
+6. Deterministic Python re-anchors candidates against frozen source and removes
+   anything that cannot post on the frozen added-side diff.
+7. The health evaluator compares final state and pre-approval validation results
+   with the frozen inputs. Run data and recurring failures are persisted in
+   SQLite without source or finding prose.
+8. The UI buckets the postable candidates by confidence; the human approves or
+   rejects and can save those decisions as evaluation labels without posting.
+9. `post_approved_review` verifies the head SHA is still current, requires a
    real anchor, re-anchors to an added diff line, and posts one review.
-8. Actual posted/postability-failure outcomes become additional evaluation
-   labels.
+10. Actual posted/postability-failure outcomes become additional evaluation
+    labels. Repository run and posted-comment counters are incremented
+    transactionally so concurrent sessions cannot overwrite each other.
+
+## Concurrency and persistence
+
+There are two distinct concurrency domains:
+
+```mermaid
+flowchart TD
+    subgraph RunA[One review run]
+        AOrch[Orchestrator]
+        APy[Python reviewer]
+        AGen[Generic reviewer]
+        ABudget[One locked budget instance]
+        ABudget --> AOrch
+        ABudget --> APy
+        ABudget --> AGen
+    end
+
+    subgraph RunB[Another review run]
+        BAgents[Independent agent tree]
+        BBudget[Independent locked budget instance]
+        BBudget --> BAgents
+    end
+
+    RunA --> StatsStore[FileBackedStore]
+    RunB --> StatsStore
+    StatsStore -->|BEGIN IMMEDIATE increment| StatsDB[(review_memory.db<br/>WAL + busy timeout)]
+
+    RunA --> ImproveStore[ImprovementStore]
+    RunB --> ImproveStore
+    ImproveStore --> ImproveDB[(improvement.db)]
+```
+
+Within one run, the orchestrator and separately compiled subagent graphs may
+overlap model calls. They share a single `CostTrackingMiddleware` lock, so call
+reservation, token totals, logs, and per-model rollups remain coherent.
+Different Streamlit sessions own independent agent trees, but their aggregate
+repository counters converge through an atomic SQLite read-modify-write.
+
+Feedback has two independent dimensions: human disposition and posting
+outcome. Updating one dimension first deletes its opposite label, so a finding
+cannot remain both `approved` and `rejected`, or both `posted` and
+`postability_failure`. Updating human disposition does not erase posting
+history, and vice versa.
+
+SQLite supports concurrent processes sharing one local volume. It is not used
+as a distributed lock across hosts. A multi-host deployment needs sticky access
+to one writer volume or store adapters backed by a managed transactional
+database; agent/VFS state remains isolated per run.
+
+## Configuration and budget semantics
+
+Configuration is resolved once into an immutable `ReviewSettings` value for a
+run. Provider, profile, effort, booleans, confidence, output tokens, cost, calls,
+file count, and aggregate source size are validated strictly. Unknown choices,
+empty model overrides, malformed booleans, and out-of-range numbers raise
+`ConfigurationError`; no provider or profile silently falls back.
+
+The budget has two enforcement points:
+
+1. `before_model` locks and reserves a call. If the configured limit is already
+   reached, no provider request starts. With a limit of 25, call 26 is never
+   sent, even when subagents call concurrently.
+2. `after_model` records reported tokens and cache tiers, computes spend, and
+   stops the graph if cumulative cost crossed the configured threshold. Exact
+   cost is unavailable before a response, so one response may overshoot the
+   dollar threshold; the next request will not start.
+
+Budget interruption is recoverable. The graph checkpoint is read after an
+exception and any completed `/findings/` artifacts are returned with an
+incomplete-run health failure rather than discarded.
+
+## Packaging and quality gates
+
+```mermaid
+flowchart LR
+    Commit[Push or pull request] --> Matrix{Python 3.11, 3.12, 3.13}
+    Matrix --> Lint[Ruff]
+    Lint --> Tests[Pytest + branch coverage]
+    Tests --> Eval[Offline golden evaluation]
+    Eval --> Build[Build sdist and wheel]
+    Build --> Install[Force-install wheel]
+    Install --> Resources{App and five skills found?}
+    Resources -->|yes| Audit[pip-audit]
+    Resources -->|no| Fail[Fail CI]
+    Audit --> Pass[CI passes]
+```
+
+The wheel installs the `quorum-review` and `quorum-eval` entry points. `app.py`
+and the five skill directories are data resources under `share/quorum`; runtime
+resolution checks an explicit `QUORUM_SKILLS_DIR`, the source checkout, then
+the installed data directory. The source distribution also includes the app,
+skills, and sanitized evaluation fixtures.
+
+CI is fully offline through the test/evaluation stages. It requires the Ruff
+rules configured in `pyproject.toml`, the 65% branch-aware coverage floor, and
+perfect precision, recall, F1, and anchor accuracy on the checked-in smoke
+fixture before building. `pip-audit` is the only gate that needs vulnerability
+advisory data from the network.
 
 ## Deviations from the specification
 
@@ -95,7 +268,7 @@ adaptations keep the design running on the installed version (`deepagents`
    filenames, and source are explicitly treated as untrusted data rather than
    system instructions.
 
-6. **The cost ceiling is attached to the subagents too.** Subagents are
+6. **The budget guard is attached to the subagents too.** Subagents are
    separately compiled graphs, so parent middleware does not propagate into
    them. One shared `CostTrackingMiddleware` instance is passed to the
    orchestrator and both subagents; a ceiling on the orchestrator alone would
@@ -128,8 +301,14 @@ adaptations keep the design running on the installed version (`deepagents`
   In practice caching carries almost the entire prompt: measured runs show
   `uncached=2` tokens per call once the cache is warm.
 - **Frozen-target tools.** The tool schemas do not accept owner, repository, PR,
-  or ref arguments. A model cannot redirect a run after reading hostile PR
-  content, and findings outside the frozen eligible manifest are discarded.
+  or ref arguments. `regex_search` accepts a pattern and safe `/pr/` path, then
+  reads content from the backend; it does not accept full source text from the
+  model. A model cannot redirect a run after reading hostile PR content, and
+  findings outside the frozen eligible manifest are discarded.
+- **Pre-approval postability.** Frozen source and patch evidence are parsed
+  before the confidence gate. Missing anchors and off-added-side lines are
+  removed before they can consume human attention; corrected lines are visible
+  in the trace. Posting repeats the checks against current GitHub state.
 - **Durable improvement evidence.** Health-contract failures are fingerprinted
   by repository and invariant. Human decisions and posting outcomes are saved
   as sanitized evaluation cases. Duplicate persistence of the same run is
@@ -147,10 +326,30 @@ adaptations keep the design running on the installed version (`deepagents`
 | Host filesystem | Run artifacts live in agent state; `/skills/` is read-only. SQLite and aggregate run statistics are the only intended persistent writes. |
 | Comment placement | The reviewed head must still be current; anchors must exist; only lines on the `+` side are posted. |
 | Posting | Requires explicit human approval. The agent has no posting tool. |
-| Spend | Hard ceiling enforced by middleware, shared across orchestrator and subagents. |
+| Spend | Exact pre-call count ceiling plus a post-response dollar stop threshold, enforced by one locked middleware instance shared across orchestrator and subagents. |
 | Improvement data | Stores metadata and anchor hashes, never source, patches, PR prose, finding bodies, suggestions, or anchor text. |
 | Credentials | Read from `.env`, which is git-ignored. Never enter the VFS or a prompt. |
 
+Reviews also fail before model execution if eligible input exceeds the
+configured file-count or aggregate-character limits; Quorum never silently
+substitutes a partial review. Skills and `app.py` are wheel data resources, so
+the same boundaries apply to editable and installed execution.
+
+## Current scope limits
+
+- Removed files are skipped because GitHub posting is currently implemented
+  only for the added/right side of a diff.
+- A single source file is truncated after 100,000 characters and causes the
+  `source_truncation` health check to fail. Aggregate source above the configured
+  limit is refused instead of truncated.
+- SQLite persistence is safe for concurrent sessions on a shared local volume,
+  not for independent multi-host writers without a shared transactional store.
+- The checked-in evaluation pair is a harness smoke test, not a statistically
+  meaningful quality benchmark. Production calibration needs multiple
+  sanitized golden PR cases with reviewed false-positive and false-negative
+  labels.
+- Exact dollar preauthorization is impossible with provider-reported token
+  usage; the call ceiling is exact, while cost is a post-response stop threshold.
 
 ## Historical measured behavior
 

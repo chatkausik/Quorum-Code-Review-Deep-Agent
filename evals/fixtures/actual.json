@@ -1,0 +1,24 @@
+{
+  "comments": [
+    {
+      "path": "src/db.py",
+      "line": 10,
+      "severity": "critical",
+      "category": "security",
+      "confidence": 98,
+      "anchor_text": "cursor.execute(f\"SELECT * FROM users WHERE id = {uid}\")",
+      "title": "SQL injection through interpolation",
+      "body": "User-controlled input is interpolated into the SQL statement."
+    },
+    {
+      "path": "src/service.py",
+      "line": 24,
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": 84,
+      "anchor_text": "result = blocking_call()",
+      "title": "Blocking call in coroutine",
+      "body": "The synchronous operation blocks the event loop."
+    }
+  ]
+}

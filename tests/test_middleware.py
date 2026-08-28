@@ -77,7 +77,7 @@ class TestCostCeiling:
 
     def test_cost_ceiling_halts_the_run(self):
         cost = CostTrackingMiddleware(max_cost_usd=1.00, max_calls=10_000)
-        with pytest.raises(BudgetExceeded, match="Cost ceiling"):
+        with pytest.raises(BudgetExceeded, match="Cost stop threshold"):
             for _ in range(50):
                 cost.record("claude-opus-5", 100_000, 5_000)
         assert cost.total_cost_usd > 1.00
@@ -120,6 +120,25 @@ class TestCostCeiling:
         assert cost.calls == 10
         with pytest.raises(BudgetExceeded):
             cost.record("claude-sonnet-5", 100, 100)
+
+    def test_runtime_call_limit_is_enforced_before_the_next_request(self):
+        cost = CostTrackingMiddleware(max_cost_usd=1000.0, max_calls=2)
+        for _ in range(2):
+            cost.before_model({}, None)
+            cost.record("claude-sonnet-5", 10, 10)
+
+        with pytest.raises(BudgetExceeded, match="No additional model call"):
+            cost.before_model({}, None)
+        assert cost.calls == 2
+
+    def test_runtime_cost_threshold_blocks_the_next_request(self):
+        cost = CostTrackingMiddleware(max_cost_usd=0.001, max_calls=10)
+        cost.before_model({}, None)
+        with pytest.raises(BudgetExceeded, match="Cost stop threshold"):
+            cost.record("claude-sonnet-5", 1000, 0)
+
+        with pytest.raises(BudgetExceeded, match="No additional model call"):
+            cost.before_model({}, None)
 
 
 class TestPRMetadata:

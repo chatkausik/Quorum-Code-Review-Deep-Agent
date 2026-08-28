@@ -16,36 +16,42 @@ with its AI-review attribution, severity, and category.
 
 ## How it works
 
-![Quorum architecture — frozen source, deep-agent orchestrator, confidence-gated approval, deterministic posting](docs/images/quorum-architecture.png)
+![Quorum end-to-end architecture: trusted PR freezing, bounded agent review, pre-approval validation, human gating, and deterministic GitHub posting](docs/images/quorum-system-overview.png)
 
-```
-Streamlit UI  ──run_review()──▶  Deep Agent Orchestrator (configured model)
-                                          ▲
-                         frozen manifest + immutable source
-                                          │
-                                 task(name=...) delegates per file
-                                          │
-                          ┌───────────────┴───────────────┐
-                    python_reviewer                 generic_reviewer
-                    (configured model)              (configured model)
-                    regex_search, bandit            regex_search
-                    3 Python skills                 2 generic skills
-                          └───────────────┬───────────────┘
-                              /findings/<file>.json  (virtual filesystem)
-                                          │
-                                 FINAL_FINDINGS_JSON
-                                          │
-                          Confidence-gated HITL in the UI
-                                          │
-                     post_approved_review()  ── deterministic, no LLM
-                       re-anchor → unidiff validate → one review
-                                          │
-                           SQLite outcomes + health contracts
+The illustrated overview shows the complete product boundary. The Mermaid flow
+below is the editable companion used to keep the runtime sequence current.
+
+```mermaid
+flowchart TD
+    Human([Human reviewer]) --> UI[Streamlit UI]
+    UI --> Loader[Freeze PR identity, head SHA, manifest, source, and patches]
+    GitHub[(GitHub API)] --> Loader
+    Loader --> Limits{Within file and character limits?}
+    Limits -->|No| Refuse[Refuse partial review]
+    Limits -->|Yes| VFS[(Immutable /pr and /patches VFS)]
+
+    VFS --> Orchestrator[Configured-model orchestrator]
+    Budget[Shared locked budget guard] --> Orchestrator
+    Orchestrator --> Python[Python reviewer<br/>3 skills + Bandit]
+    Orchestrator --> Generic[Generic reviewer<br/>2 skills]
+    Python --> Artifacts[(Per-file JSON artifacts)]
+    Generic --> Artifacts
+    Artifacts --> Normalize[Normalize, scope, merge, and deduplicate]
+    Normalize --> Preapprove[Re-anchor against frozen source<br/>reject missing or off-diff anchors]
+    Preapprove --> Health[15 deterministic health checks]
+    Health --> UI
+
+    UI -->|approval and rejection labels| Improve[(SQLite improvement data)]
+    Health --> Improve
+    UI -->|approved findings only| Post[Recheck head, source, and current diff]
+    Post -->|one review| GitHub
+    Post -->|posted or postability labels| Improve
 ```
 
 The orchestrator is a loop, not a pipeline. What is *not* left to the model:
 the budget ceiling, target and head SHA, eligible-file manifest, source
-mounting, line-number validation, health evaluation, and the decision to post.
+mounting, input-size limits, line-number and diff validation, health evaluation,
+and the decision to post.
 
 ## What it looks like
 
@@ -63,10 +69,13 @@ highlighted in context, why it matters, and a colour-coded suggested fix.
 ![Quorum finding detail](docs/images/quorum-finding-detail.png)
 
 **The Improve tab is the thing to read before trusting a low finding count.**
-Thirteen deterministic contracts are evaluated against trusted run state rather
+Fifteen deterministic contracts are evaluated against trusted run state rather
 than model claims; failures become fingerprinted, recurring issues.
 
 ![Quorum improve tab](docs/images/quorum-improve-issues.png)
+
+_The screenshot documents the issue workflow from the earlier 13-contract UI;
+the current runtime adds `diff_availability` and `finding_postability`._
 
 The [operations guide](docs/OPERATIONS_GUIDE.md#ui-screenshots) has the full
 set, including the empty state and a run in progress.
@@ -74,10 +83,13 @@ set, including the empty state and a run in progress.
 ## Documentation
 
 - [Operations and event guide](docs/OPERATIONS_GUIDE.md) — annotated runtime
-  flows, event catalog, Claude routing, health contracts, feedback lifecycle,
+  flows, event catalog, model routing, health contracts, feedback lifecycle,
   posting boundary, and screenshot plan.
 - [Architecture reference](ARCHITECTURE.md) — component contracts, trust
-  boundaries, API adaptations, and historical benchmark notes.
+  boundaries, concurrency and scaling model, packaging, API adaptations, and
+  historical benchmark notes.
+- [Evaluation guide](evals/README.md) — golden-fixture format, scoring identity,
+  threshold gates, and safe benchmark expansion.
 
 ## Setup
 
@@ -87,36 +99,59 @@ python3 -m venv .venv
 cp .env.example .env      # then fill in GitHub + the selected model provider
 ```
 
-`.env` needs:
+`.env` needs a GitHub credential and a key for the selected model provider:
 
-| Variable | Purpose |
-| --- | --- |
-| `OPENAI_API_KEY` | Orchestrator and subagents (default provider) |
-| `ANTHROPIC_API_KEY` | Only if `MODEL_PROVIDER=anthropic` |
-| `GITHUB_TOKEN` | Read the PR, post the review. Classic PAT with `repo`, or fine-grained with *Pull requests: read and write* |
-| `LANGSMITH_API_KEY` | Optional. Enables tracing and the in-app trace links |
-| `REVIEW_IMPROVEMENT_DB` | Optional SQLite path for health, decisions, and evaluation cases; defaults under `REVIEW_MEMORY_DIR` |
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MODEL_PROVIDER` | `openai` | `openai` or `anthropic`; any other value fails startup. |
+| `OPENAI_API_KEY` | — | Required when OpenAI is selected. |
+| `ANTHROPIC_API_KEY` | — | Required when Anthropic is selected. |
+| `GITHUB_TOKEN` | `gh auth token` fallback | Reads the PR and posts an approved review. Use a classic PAT with `repo`, or fine-grained *Pull requests: read and write*. |
+| `REVIEW_COST_PROFILE` | `balanced` | `economy`, `balanced`, or `thorough`. |
+| `REVIEW_MAX_COST_USD` | `1.00` | Post-response cost stop threshold for the complete agent tree. |
+| `REVIEW_MAX_LLM_CALLS` | `25` | Exact pre-request call ceiling shared by orchestrator and subagents. |
+| `REVIEW_MAX_FILES` | `50` | Maximum eligible files; excess input is refused before model execution. |
+| `REVIEW_MAX_TOTAL_CHARS` | `1000000` | Maximum aggregate frozen source size. |
+| `REVIEW_CONFIDENCE_THRESHOLD` | `75` | Findings at or above this score start selected in the UI. |
+| `REVIEW_DOCS` | profile default | Include markdown/documentation files when `true`. |
+| `REVIEW_MEMORY_DIR` | `~/.quorum_memory` | SQLite-backed aggregate repository counters. |
+| `REVIEW_IMPROVEMENT_DB` | `<memory dir>/improvement.db` | Health runs, recurring issues, decisions, and sanitized evaluation cases. |
+| `LANGSMITH_API_KEY` | disabled | Enables tracing and in-app trace links when set to a real key. |
+| `QUORUM_SKILLS_DIR` | auto-detected | Optional override for custom/nonstandard skill installations. |
+
+Configuration fails closed: unknown providers/profiles, invalid booleans, and
+out-of-range limits stop startup rather than silently selecting a fallback.
+Private PR source is sent to the selected model provider. If LangSmith tracing
+is enabled, prompts, tool calls, source excerpts, and model responses may also
+be retained by LangSmith; review its access and retention settings before using
+tracing on private repositories.
 
 ### Cost profiles
 
-Pick in the sidebar, or set `REVIEW_COST_PROFILE`. Measured on a real 4-file PR
-with ~20 findings:
+Pick a profile in the sidebar, or set `REVIEW_COST_PROFILE`. Profiles resolve
+strictly within the selected provider:
 
-| Profile | Orchestrator | Subagents | Cost | Findings |
+| Profile | OpenAI orchestrator / subagent | Anthropic orchestrator / subagent | Effort | Docs |
 | --- | --- | --- | --- | --- |
-| `economy` | `gpt-5.4-mini` (low) | `gpt-5.4-nano` (low) | **$0.07** | 20 |
-| `balanced` | `gpt-5.4` (medium) | `gpt-5.4-mini` (low) | **$0.23** | 20 |
-| `thorough` | `gpt-5.5` (high) | `gpt-5.4` (medium) | ~$1+ | — |
+| `economy` | `gpt-5.4-mini` / `gpt-5.4-nano` | `claude-sonnet-5` / `claude-haiku-4-5` | low / low | skipped |
+| `balanced` | `gpt-5.4` / `gpt-5.4-mini` | `claude-sonnet-5` / `claude-sonnet-5` | medium / low | skipped |
+| `thorough` | `gpt-5.5` / `gpt-5.4` | `claude-opus-5` / `claude-sonnet-5` | high / medium | included |
 
-Economy matched Balanced finding-for-finding on that benchmark at a third of
-the price, so start there. Set `MODEL_PROVIDER=anthropic` to switch providers;
-the same three profiles map onto Claude models.
+On one measured four-file PR with roughly 20 findings, Economy and Balanced
+returned the same findings at approximately $0.07 and $0.23 respectively.
+Treat those numbers as historical observations, not price guarantees; model
+pricing, cache behavior, PR shape, and provider all affect a run.
 
 ## Run
 
 ```bash
-.venv/bin/streamlit run app.py
+.venv/bin/quorum-review
 ```
+
+For source-only development, `.venv/bin/streamlit run app.py` is equivalent.
+The `quorum-review` command also works from an installed wheel and resolves the
+packaged Streamlit entry point and five bundled skills without relying on the
+checkout directory.
 
 Enter owner, repository, and PR number, then click **Run Review**. Findings
 appear in two buckets:
@@ -132,12 +167,34 @@ markdown report.
 
 ```bash
 .venv/bin/python -m pytest
+.venv/bin/ruff check .
+.venv/bin/python -m pytest --cov=quorum --cov-report=term-missing
 ```
 
 Covers line-number re-anchoring, stale-head rejection, bound GitHub tools,
 immutable VFS boundaries, scanner argument validation, the cost kill switch,
-health contracts, finding normalization, and SQLite feedback persistence. No
-network or credentials required.
+health contracts, finding normalization, concurrent SQLite increments,
+contradictory-label replacement, package resource discovery, and review-size
+refusal. No network or credentials are required.
+
+Recorded outputs can be scored for precision, recall, F1, and anchor accuracy:
+
+```bash
+quorum-eval evals/fixtures/expected.json evals/fixtures/actual.json \
+  --min-precision 1 --min-recall 1 --min-f1 1 --min-anchor-accuracy 1
+```
+
+CI runs these gates on Python 3.11, 3.12, and 3.13, requires at least 65%
+branch-aware coverage, audits installed dependencies, builds both distribution
+formats, force-installs the wheel, and verifies that the app and skill resources
+survive installation.
+
+To reproduce the package check locally:
+
+```bash
+.venv/bin/python -m build
+.venv/bin/pip-audit
+```
 
 ## Design notes
 
@@ -150,8 +207,11 @@ redeploy, and anyone can read what the agent "knows" without reading code.
 Python skills; `generic_reviewer` gets neither, because bandit is Python-only.
 Smaller tool sets produce sharper findings.
 
-**The cost ceiling is enforced, not requested.** `CostTrackingMiddleware`
-raises past `$1.00` or 25 LLM calls. One shared instance is attached to the
+**The budget guard is enforced, not requested.** `CostTrackingMiddleware`
+reserves calls before execution, so a 25-call limit never starts call 26. Cost
+is necessarily measured after a provider responds, so `$1.00` is a stop
+threshold rather than a guarantee that the final response cannot overshoot it.
+One shared, locked instance is attached to the
 orchestrator *and* both subagents — subagents are separately compiled graphs,
 so a ceiling on the orchestrator alone would not bound the run. A killed run
 still returns whatever findings reached `/findings/`, recovered from the last
@@ -171,8 +231,9 @@ reviewing it produces soft findings at real cost.
 
 **LLMs hallucinate line numbers, so posting does not trust them.** Every
 comment carries a verbatim `anchor_text`. Before posting, each comment is
-re-anchored to the line where its anchor text actually appears, then dropped
-entirely if it does not land on the `+` side of the diff.
+re-anchored and checked against the frozen `+` side before it reaches the
+approval UI. The post step repeats the same checks against current GitHub state
+and rejects a stale head.
 
 **HITL lives in the UI, not the framework.** The agent's job ends at "produce
 candidate findings". Keeping the gate in the UI makes it provider-agnostic and
@@ -184,7 +245,16 @@ manifest and file content at one head SHA before the graph starts. `/pr/` and
 `/patches/` are read-only to agents; they may only write JSON below
 `/findings/`. The scanner accepts a narrow Bandit reporting grammar over exact
 `/pr/` files and runs without a shell in a temporary directory. `/skills/` is
-backed by real disk and mounted read-only.
+backed by source or installed package data and mounted read-only. The model's
+`regex_search` tool accepts only a pattern and a safe `/pr/` path; source is
+read from the frozen backend rather than copied back through a tool argument.
+
+**Repository counters are safe across concurrent sessions.** Aggregate run and
+posted-comment counters use transactional SQLite increments with WAL mode and a
+busy timeout. Existing JSON counters are imported once. The separate
+improvement database stores health and feedback metadata, and replaces labels
+within mutually exclusive dimensions (`approved`/`rejected` and
+`posted`/`postability_failure`) instead of retaining contradictions.
 
 ## Improvement loop
 
@@ -216,3 +286,18 @@ push to GitHub.
 
 See `ARCHITECTURE.md` for the component reference and the deviations from the
 original specification.
+
+## Large pull requests
+
+Quorum refuses to start a silent partial review above 50 eligible files or
+1,000,000 aggregate source characters. Adjust `REVIEW_MAX_FILES` and
+`REVIEW_MAX_TOTAL_CHARS` deliberately, or split the pull request. Individual
+files remain capped at 100,000 characters and surface a health failure if
+truncated. Removed files are currently skipped because the posting path supports
+only comments on the added/right side of a GitHub diff.
+
+Multiple Streamlit sessions on one host can safely share the SQLite stores.
+SQLite is not a multi-host coordination service: a horizontally scaled
+deployment should place sessions on one writer volume or replace the two store
+implementations with a managed transactional database. Agent state remains
+per-run and ephemeral in either topology.
