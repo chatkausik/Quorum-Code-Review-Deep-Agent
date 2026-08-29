@@ -16,10 +16,12 @@ with its AI-review attribution, severity, and category.
 
 ## How it works
 
-![Quorum end-to-end architecture: trusted PR freezing, bounded agent review, pre-approval validation, human gating, and deterministic GitHub posting](docs/images/quorum-system-overview.png)
+![Quorum end-to-end architecture: trusted PR freezing, bounded agent review, deterministic validation, human gating, three-layer memory, and GitHub posting](docs/images/quorum-system-overview.png)
 
 The illustrated overview shows the complete product boundary. The Mermaid flow
-below is the editable companion used to keep the runtime sequence current.
+below is the concise editable companion used to keep the runtime sequence
+current. The static image is generated from
+[`docs/diagrams/quorum-system-overview.mmd`](docs/diagrams/quorum-system-overview.mmd).
 
 ```mermaid
 flowchart TD
@@ -30,6 +32,8 @@ flowchart TD
     Limits -->|No| Refuse[Refuse partial review]
     Limits -->|Yes| VFS[(Immutable /pr and /patches VFS)]
 
+    Stats[(SQLite counters<br/>transactional source of truth)] -->|trusted integers| Orchestrator
+    Memory[(Mem0 semantic outcomes<br/>optional and sanitized)] -->|bounded untrusted context| Orchestrator
     VFS --> Orchestrator[Configured-model orchestrator]
     Budget[Shared locked budget guard] --> Orchestrator
     Orchestrator --> Python[Python reviewer<br/>3 skills + Bandit]
@@ -43,9 +47,14 @@ flowchart TD
 
     UI -->|approval and rejection labels| Improve[(SQLite improvement data)]
     Health --> Improve
+    Health -->|atomic run count| Stats
+    Health -->|aggregate outcome only| Memory
+    UI -->|aggregate decisions only| Memory
     UI -->|approved findings only| Post[Recheck head, source, and current diff]
     Post -->|one review| GitHub
     Post -->|posted or postability labels| Improve
+    Post -->|atomic posted count| Stats
+    Post -->|aggregate post outcome only| Memory
 ```
 
 The orchestrator is a loop, not a pipeline. What is *not* left to the model:
@@ -116,6 +125,12 @@ cp .env.example .env      # then fill in GitHub + the selected model provider
 | `REVIEW_DOCS` | profile default | Include markdown/documentation files when `true`. |
 | `REVIEW_MEMORY_DIR` | `~/.quorum_memory` | SQLite-backed aggregate repository counters. |
 | `REVIEW_IMPROVEMENT_DB` | `<memory dir>/improvement.db` | Health runs, recurring issues, decisions, and sanitized evaluation cases. |
+| `MEM0_API_KEY` | disabled | Enables optional hosted semantic memory when set to a real key. |
+| `MEM0_ENABLED` | auto | Explicitly enable or disable Mem0; defaults to enabled when `MEM0_API_KEY` is present. |
+| `MEM0_APP_ID` | `quorum-code-review` | Separates Quorum memories from other applications in the same Mem0 account. |
+| `MEM0_TOP_K` | `8` | Maximum repository-scoped memories requested for one review. |
+| `MEM0_MAX_CONTEXT_CHARS` | `4000` | Hard limit on retrieved Mem0 text added to the task. |
+| `MEM0_TIMEOUT_SECONDS` | `10` | Hosted-memory request timeout; failures fall back to local-only operation. |
 | `LANGSMITH_API_KEY` | disabled | Enables tracing and in-app trace links when set to a real key. |
 | `QUORUM_SKILLS_DIR` | auto-detected | Optional override for custom/nonstandard skill installations. |
 
@@ -124,7 +139,11 @@ out-of-range limits stop startup rather than silently selecting a fallback.
 Private PR source is sent to the selected model provider. If LangSmith tracing
 is enabled, prompts, tool calls, source excerpts, and model responses may also
 be retained by LangSmith; review its access and retention settings before using
-tracing on private repositories.
+tracing on private repositories. When Mem0 is enabled, Quorum sends only
+deterministic aggregate outcome summaries under an opaque SHA-256-derived
+repository ID. It does not send raw repository names, source, patches, paths,
+PR text, finding prose, suggestions, anchors, line locations, SHAs, review
+URLs, or provider errors.
 
 ### Cost profiles
 
@@ -153,6 +172,11 @@ The `quorum-review` command also works from an installed wheel and resolves the
 packaged Streamlit entry point and five bundled skills without relying on the
 checkout directory.
 
+After changing configuration exports or upgrading dependencies while the UI is
+running, stop the existing Streamlit process with Ctrl-C and start it again.
+Streamlit hot reload can retain an already-imported Python module; a full
+restart ensures new `.env` values and exports such as `MEM0_API_KEY` are loaded.
+
 Enter owner, repository, and PR number, then click **Run Review**. Findings
 appear in two buckets:
 
@@ -175,7 +199,9 @@ Covers line-number re-anchoring, stale-head rejection, bound GitHub tools,
 immutable VFS boundaries, scanner argument validation, the cost kill switch,
 health contracts, finding normalization, concurrent SQLite increments,
 contradictory-label replacement, package resource discovery, and review-size
-refusal. No network or credentials are required.
+refusal. Mem0 tests inject a fake client and assert repository scoping,
+context bounds, failure isolation, idempotency, and privacy exclusions. No
+network or credentials are required.
 
 Recorded outputs can be scored for precision, recall, F1, and anchor accuracy:
 
@@ -256,6 +282,19 @@ improvement database stores health and feedback metadata, and replaces labels
 within mutually exclusive dimensions (`approved`/`rejected` and
 `posted`/`postability_failure`) instead of retaining contradictions.
 
+**Long-term memory has three deliberately different layers.**
+`FileBackedStore` is the transactional source of truth for aggregate counters;
+`ImprovementStore` is the transactional source of truth for health, issues,
+human labels, and sanitized evaluation cases. Optional `Mem0LongTermMemory`
+adds semantic recall across sessions and hosts. It searches with a fixed query,
+uses an opaque SHA-256-derived repository entity ID, caps returned context, and
+labels it untrusted before model use. Writes are deterministic aggregate
+summaries only. Mem0 is additive and best effort: an SDK, network, credential,
+or service failure never blocks review, feedback saving, or posting. See the
+[Mem0 platform quickstart](https://docs.mem0.ai/platform/quickstart) and
+[entity-scoped memory guide](https://docs.mem0.ai/platform/features/entity-scoped-memory)
+for the hosted API model.
+
 ## Improvement loop
 
 The implementation incorporates the useful control-loop patterns from
@@ -300,4 +339,6 @@ Multiple Streamlit sessions on one host can safely share the SQLite stores.
 SQLite is not a multi-host coordination service: a horizontally scaled
 deployment should place sessions on one writer volume or replace the two store
 implementations with a managed transactional database. Agent state remains
-per-run and ephemeral in either topology.
+per-run and ephemeral in either topology. Mem0 is already hosted and can be
+shared across hosts through the same `MEM0_APP_ID`; it does not replace the
+transactional stores.

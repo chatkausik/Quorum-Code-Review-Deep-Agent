@@ -28,6 +28,7 @@ from quorum.config import (
     resolve_review_settings,
 )
 from quorum.improvement import ImprovementStore
+from quorum.long_term_memory import Mem0LongTermMemory
 from quorum.memory import FileBackedStore
 from quorum.models import SEVERITY_ORDER, ReviewComment
 from quorum.observability import project_url
@@ -374,6 +375,8 @@ with st.sidebar:
         st.session_state.store = FileBackedStore()
     if "improvement_store" not in st.session_state:
         st.session_state.improvement_store = ImprovementStore()
+    if "long_term_memory" not in st.session_state:
+        st.session_state.long_term_memory = Mem0LongTermMemory()
 
     st.divider()
     if langsmith_enabled():
@@ -384,6 +387,11 @@ with st.sidebar:
         )
     else:
         st.caption("🔬 LangSmith tracing off — set `LANGSMITH_API_KEY` in `.env`.")
+
+    if st.session_state.long_term_memory.available:
+        st.caption("🧠 Mem0 long-term memory on · sanitized aggregates only")
+    else:
+        st.caption("🧠 Mem0 long-term memory off — set `MEM0_API_KEY` in `.env`.")
 
     if owner and repo:
         stats = st.session_state.store.get_stats(owner, repo)
@@ -458,6 +466,7 @@ if run_clicked:
                     int(pr_number),
                     store=st.session_state.store,
                     improvement_store=st.session_state.improvement_store,
+                    long_term_memory=st.session_state.long_term_memory,
                     profile=profile,
                     on_event=on_event,
                 )
@@ -635,6 +644,15 @@ else:
                         else rejection_reason
                     ),
                 )
+                st.session_state.long_term_memory.record_decisions(
+                    result,
+                    selected,
+                    rejection_reason=(
+                        None
+                        if rejection_reason in (None, "not specified")
+                        else rejection_reason
+                    ),
+                )
                 st.success("Approval feedback saved as evaluation data.")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Saving feedback failed — {type(exc).__name__}: {exc}")
@@ -656,6 +674,15 @@ else:
                                 else rejection_reason
                             ),
                         )
+                        st.session_state.long_term_memory.record_decisions(
+                            result,
+                            selected,
+                            rejection_reason=(
+                                None
+                                if rejection_reason in (None, "not specified")
+                                else rejection_reason
+                            ),
+                        )
                     except Exception as exc:  # noqa: BLE001
                         st.warning(
                             "The review can still post, but feedback persistence failed: "
@@ -666,6 +693,9 @@ else:
                     )
                     try:
                         st.session_state.improvement_store.record_post_result(
+                            result, selected, st.session_state.post_result
+                        )
+                        st.session_state.long_term_memory.record_post_result(
                             result, selected, st.session_state.post_result
                         )
                     except Exception as exc:  # noqa: BLE001

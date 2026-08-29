@@ -249,6 +249,22 @@ IMPROVEMENT_DB = Path(
     os.getenv("REVIEW_IMPROVEMENT_DB", str(MEMORY_DIR / "improvement.db"))
 ).expanduser()
 
+# Mem0 is an optional semantic layer on top of the local transactional stores.
+# It receives only deterministic, sanitized outcome summaries -- never source,
+# patches, paths, finding prose, anchors, PR text, or repository names.
+MEM0_API_KEY = os.getenv("MEM0_API_KEY")
+MEM0_ENABLED = _env_bool(
+    "MEM0_ENABLED", bool(MEM0_API_KEY and MEM0_API_KEY.strip())
+)
+MEM0_APP_ID = _env_text("MEM0_APP_ID", "quorum-code-review")
+MEM0_TOP_K = _env_int("MEM0_TOP_K", 8, minimum=1, maximum=50)
+MEM0_MAX_CONTEXT_CHARS = _env_int(
+    "MEM0_MAX_CONTEXT_CHARS", 4_000, minimum=256, maximum=20_000
+)
+MEM0_TIMEOUT_SECONDS = _env_int(
+    "MEM0_TIMEOUT_SECONDS", 10, minimum=1, maximum=60
+)
+
 # --- observability --------------------------------------------------------
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY")
 LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "code-review-agent")

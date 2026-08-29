@@ -11,10 +11,13 @@ For implementation-level component notes, see
 
 ## System at a glance
 
-![Quorum system overview from PR admission through deterministic posting](images/quorum-system-overview.png)
+![Quorum system overview from PR admission through deterministic posting and sanitized semantic memory](images/quorum-system-overview.png)
 
 Use this visual for orientation and the Mermaid flow below for exact operational
-relationships and failure paths.
+relationships and failure paths. The image is generated from the checked-in
+[`diagrams/quorum-system-overview.mmd`](diagrams/quorum-system-overview.mmd)
+source; see the [diagram README](diagrams/README.md) for regeneration and
+visual-verification instructions.
 
 ```mermaid
 flowchart TD
@@ -43,6 +46,7 @@ flowchart TD
     GitHub[(GitHub API)]
     Improve[(SQLite improvement store)]
     Stats[(SQLite repository counters)]
+    Semantic[(Mem0 semantic outcomes<br/>optional and sanitized)]
 
     Human -->|select PR + run| UI
     UI --> Loader
@@ -51,6 +55,8 @@ flowchart TD
     Limits -->|accepted| Manifest
     Limits -->|too large| UI
     Manifest --> VFS
+    Stats -->|trusted integer counters| Orchestrator
+    Semantic -->|bounded untrusted history| Orchestrator
     VFS --> Orchestrator
     Budget --> Orchestrator
     Budget --> Python
@@ -67,17 +73,23 @@ flowchart TD
     FrozenCheck --> Health
     Health --> UI
     Health --> Improve
+    Health -->|atomic run count| Stats
+    Health -->|aggregate outcome only| Semantic
     UI -->|approved comments only| Post
     Post -->|re-read current head and diff| GitHub
     Post -->|one GitHub review| GitHub
     UI -->|approval / rejection| Improve
     Post -->|posted / rejected by boundary| Improve
+    Post -->|atomic posted count| Stats
+    UI -->|aggregate decisions only| Semantic
+    Post -->|aggregate post outcome only| Semantic
     UI <--> Stats
 ```
 
-The separation is intentional. The configured model decides how to inspect and delegate a
-review, but it cannot change the selected repository, mutate reviewed source,
-write persistent memory, or post to GitHub.
+The separation is intentional. The configured model decides how to inspect and
+delegate a review, but it cannot change the selected repository, mutate
+reviewed source, write persistent memory, or post to GitHub. Trusted Python
+alone reads and writes the optional semantic layer.
 
 ## Provider and profile routing
 
@@ -141,6 +153,7 @@ sequenceDiagram
     participant Health as Health evaluator
     participant DB as SQLite improvement store
     participant Stats as SQLite repository counters
+    participant Mem0 as Mem0 semantic memory
 
     Human->>UI: Enter owner, repo, PR, threshold, profile
     Human->>UI: Click Run Review
@@ -151,6 +164,9 @@ sequenceDiagram
         Run->>GH: Load UTF-8 source at frozen head
         Run->>Run: Enforce file and aggregate-size limits
     end
+    Run->>Stats: Load trusted integer counters
+    Run->>Mem0: Search fixed query under opaque repository scope
+    Mem0-->>Run: Bounded untrusted aggregate outcome history
     Run->>VFS: Preload immutable /pr and /patches evidence
     Run->>A: Start graph with frozen evidence
 
@@ -183,16 +199,19 @@ sequenceDiagram
     Run->>Health: Compare state and validation with frozen evidence
     Health-->>Run: 15 deterministic checks
     Run->>DB: Persist run and recurring failures
+    Run->>Mem0: Add sanitized aggregate review outcome
     Run->>Stats: Atomic run-counter increment
     Run-->>UI: ReviewResult
     UI-->>Human: Findings, health, costs, and trace
 
     Human->>UI: Approve / reject findings
     UI->>DB: Save decision labels
+    UI->>Mem0: Add sanitized aggregate decision outcome
     opt Post approved comments
         UI->>GH: Recheck head SHA, source, and current diff
         UI->>GH: Create one validated review
         UI->>DB: Save posted / postability labels
+        UI->>Mem0: Add sanitized aggregate posting outcome
         UI->>Stats: Atomic posted-comment increment
     end
 ```
@@ -216,6 +235,8 @@ sequenceDiagram
   diff are rejected.
 - If an anchor is absent or does not land on an added diff line, that comment
   is independently rejected again at posting time.
+- If Mem0 is disabled, unavailable, slow, or rejects a credential, the same
+  operation continues with local SQLite history only.
 
 ## Live event flow
 
@@ -256,7 +277,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | Plan | `Starting review of owner/repo#PR` | `run_review` | A unique run ID and selected profile are active. |
 | Plan | `Planning the run` | Orchestrator `write_todos` call | The orchestrator decomposed the review. |
-| Memory | `Loaded trusted historical counters` | `FileBackedStore` | Only integer run/post counters are supplied; the model cannot mutate them. |
+| Memory | `Loaded long-term review memory` | `FileBackedStore` + optional Mem0 adapter | Trusted integer counters and a bounded count of untrusted, sanitized semantic memories are supplied; the model cannot mutate either store. |
 | Fetch | `Froze pull-request target and manifest` | Trusted loader | Repository, PR number, head SHA, eligible paths, and skipped paths are fixed. |
 | Fetch | `Reading frozen PR metadata` | Bound `fetch_pr` tool | The orchestrator is reading untrusted title/body data for context. |
 | Fetch | `Reading frozen manifest` | Bound `list_files` tool | The model sees only files selected by trusted Python. |
@@ -374,6 +395,31 @@ Not stored:
 - model-provider error messages that could echo reviewed input;
 - API keys or GitHub tokens.
 
+### Hosted semantic-memory contents
+
+When `MEM0_API_KEY` is present (or `MEM0_ENABLED=true` with a key), Mem0 stores
+only fixed-schema aggregate summaries. The entity key is a SHA-256-derived
+opaque repository identifier, and `MEM0_APP_ID` isolates Quorum data from other
+applications.
+
+Sent to Mem0:
+
+- file, finding, approval, rejection, posting, and validation-failure counts;
+- finding category/severity and confidence-band mixes;
+- validated health-contract names, completion/budget flags, and cost profile;
+- a small allowlist of generic rejection reasons.
+
+Never sent to Mem0:
+
+- owner or repository names, PR number/title/body, commit SHAs, or author;
+- source, patches, paths, line numbers, anchors, finding title/body, or fixes;
+- review URLs, posted locations, provider errors, or credentials.
+
+Retrieved text is capped by `MEM0_TOP_K` and `MEM0_MAX_CONTEXT_CHARS`, deduped,
+and inserted into the review task as untrusted informational outcome data. The
+query is fixed and contains no PR data. Mem0 failures log only the exception
+class and never block review, feedback saving, or posting.
+
 ## Approval and posting flow
 
 ```mermaid
@@ -421,6 +467,12 @@ fingerprints, feedback, and sanitized evaluation cases. If a reviewer changes a
 decision, the old opposite label is deleted before the new label is inserted.
 Posting outcomes follow the same replacement rule.
 
+The optional Mem0 adapter is created once per Streamlit session and shared by
+that session's reviews and feedback actions. It can be shared across hosts via
+one `MEM0_APP_ID`, while local SQLite remains the source of truth. Identical
+same-session events are not resent; hosted cross-process deduplication and
+semantic consolidation are Mem0 responsibilities.
+
 Run from a checkout after editable installation:
 
 ```bash
@@ -436,7 +488,32 @@ For deployment, keep all Streamlit instances that share SQLite on one durable
 writer volume. For multi-host horizontal scaling, replace `FileBackedStore` and
 `ImprovementStore` with adapters for a managed transactional database. Do not
 place independent SQLite files on each host: counters, issue status, and
-feedback would diverge.
+feedback would diverge. Configure the same Mem0 credentials and `MEM0_APP_ID`
+on every host that should share semantic history; disable it with
+`MEM0_ENABLED=false` for local-only or restricted deployments.
+
+### Restart after configuration changes
+
+Streamlit hot reload refreshes the app script but may retain already-imported
+Python modules. After changing `.env`, adding configuration exports, or
+installing/upgrading dependencies, stop the existing process with Ctrl-C and
+start it again:
+
+```bash
+.venv/bin/quorum-review
+```
+
+An error such as `cannot import name 'MEM0_API_KEY' from quorum.config` after a
+code update indicates a stale process, not a missing key. Confirm a fresh
+interpreter first, then restart the UI:
+
+```bash
+.venv/bin/python -c "from quorum.config import MEM0_API_KEY; print('config import ok')"
+```
+
+If the port is unexpectedly occupied, identify the exact listener with
+`lsof -nP -iTCP:8502 -sTCP:LISTEN` before stopping anything; do not terminate an
+unrelated application that happens to use the same port.
 
 The CI workflow validates Python 3.11–3.13, Ruff, branch-aware coverage,
 offline finding evaluation, wheel/sdist construction, installed resource
@@ -457,8 +534,9 @@ older layout relic that predates the **Improve** tab.
 
 ### Empty state
 
-The provider chip, cost profile, model routing, ceilings, and tracing status are
-all readable before a run starts. Confirm these match your intent first.
+The provider chip, cost profile, model routing, ceilings, tracing status, and
+Mem0 status are all readable before a run starts. Confirm these match your
+intent first.
 
 ![Quorum empty state](images/quorum-home-anthropic.png)
 
@@ -534,6 +612,8 @@ Before a review:
 3. Confirm the cost and call ceilings in the sidebar.
 4. Confirm file/aggregate limits are suitable for the PR or plan to split it.
 5. Decide whether documentation files should be included.
+6. If Mem0 is enabled, confirm the deployment's hosted-data policy permits the
+   sanitized aggregate fields listed above.
 
 After a review:
 
@@ -561,4 +641,4 @@ Before a release:
    `app.py` and all five skills.
 4. Run `pip-audit` with current advisory data.
 5. Review configuration, tracing retention, shared-volume, and database plans
-   for the deployment environment.
+   for the deployment environment, including Mem0 data retention and access.

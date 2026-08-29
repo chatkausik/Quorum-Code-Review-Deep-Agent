@@ -6,10 +6,13 @@ checklists, and UI captures, see the
 
 ## Runtime architecture
 
-![Quorum end-to-end runtime architecture](docs/images/quorum-system-overview.png)
+![Quorum runtime architecture with deterministic controls, bounded agents, human gating, SQLite evidence, and sanitized Mem0 outcomes](docs/images/quorum-system-overview.png)
 
 The image provides the presentation view; the Mermaid diagram below is the
-maintainable component-and-authority map.
+maintainable component-and-authority map. The presentation image is generated
+from [`docs/diagrams/quorum-system-overview.mmd`](docs/diagrams/quorum-system-overview.mmd);
+the [diagram README](docs/diagrams/README.md) contains the reproducible render
+command.
 
 ```mermaid
 flowchart LR
@@ -36,12 +39,15 @@ flowchart LR
     GitHub[(GitHub API)]
     Stats[(SQLite repository counters)]
     Improvement[(SQLite health and feedback)]
+    Semantic[(Mem0 semantic outcomes<br/>optional and sanitized)]
 
     UI --> Loader
     GitHub --> Loader
     Loader --> Limits
     Limits -->|accepted| Frozen
     Limits -->|too large| UI
+    Stats -->|trusted integer counters| Orchestrator
+    Semantic -->|bounded untrusted context| Orchestrator
     Frozen --> Orchestrator
     Budget --> Orchestrator
     Budget --> Python
@@ -57,11 +63,16 @@ flowchart LR
     Frozen --> Health
     Health --> UI
     Health --> Improvement
+    Health -->|atomic run count| Stats
+    Health -->|aggregate outcome only| Semantic
     UI --> Gate
     Gate -->|approved only| Post
     Post --> GitHub
     Gate --> Improvement
     Post --> Improvement
+    Post -->|atomic posted count| Stats
+    Gate -->|aggregate decisions only| Semantic
+    Post -->|aggregate post outcome only| Semantic
     UI <--> Stats
 ```
 
@@ -86,6 +97,7 @@ write persistent stores, or reach the GitHub posting API.
 | Virtual filesystem | `ReviewStateBackend` | 0 | Preloaded `/pr/` and `/patches/` evidence is immutable. Agents can mutate only safe `/findings/**/*.json` paths. |
 | `FileBackedStore` | Persistent store | 0 | Transactional per-repo statistics in SQLite under `~/.quorum_memory/`; imports the legacy JSON format once. |
 | `ImprovementStore` | SQLite | 0 | Run health, deduplicated recurring issues, human decisions, and sanitized evaluation cases. |
+| `Mem0LongTermMemory` | Hosted semantic adapter | 0 | Optionally retrieves bounded repository-scoped outcome history and writes deterministic aggregate review, decision, and posting summaries. It is never a source of truth. |
 | Frozen-candidate validator | Deterministic Python | 0 | Re-anchors candidates against frozen source and rejects missing anchors or lines outside the frozen added-side diff before approval. |
 | Health evaluator | Deterministic Python | 0 | Checks source/diff integrity, per-file artifacts, finding paths/anchors/lines/postability, completion, truncation, and budget. |
 | Confidence gate | UI logic | 0 | Auto-approve at/above threshold; manual decision below. |
@@ -105,9 +117,11 @@ a provider responds, so the configured amount is a post-response stop threshold.
    character limits; an oversized review fails rather than becoming partial.
 2. Trusted Python preloads `/pr/<path>` plus `/patches/<path>.patch` before the
    model runs.
-3. The orchestrator can list only that frozen target and reads immutable source
-   from the VFS. Trusted historical counters are included as integers; no model
-   tool can read or write persistent memory.
+3. Trusted Python loads local integer counters and optionally retrieves bounded
+   Mem0 history through a fixed source-free query and an opaque repository ID.
+   Retrieved text is explicitly marked untrusted and informational. The
+   orchestrator can list only the frozen target and reads immutable source from
+   the VFS; no model tool can read or write any persistent memory.
 4. Per file, it delegates via
    `task(subagent_type="python_reviewer" | "generic_reviewer")`.
    The subagent reads from `/pr/<name>` and writes `/findings/<name>.json`.
@@ -120,14 +134,16 @@ a provider responds, so the configured amount is a post-response stop threshold.
    anything that cannot post on the frozen added-side diff.
 7. The health evaluator compares final state and pre-approval validation results
    with the frozen inputs. Run data and recurring failures are persisted in
-   SQLite without source or finding prose.
+   SQLite without source or finding prose. A fixed-schema aggregate outcome is
+   also sent to Mem0 when enabled.
 8. The UI buckets the postable candidates by confidence; the human approves or
    rejects and can save those decisions as evaluation labels without posting.
 9. `post_approved_review` verifies the head SHA is still current, requires a
    real anchor, re-anchors to an added diff line, and posts one review.
-10. Actual posted/postability-failure outcomes become additional evaluation
-    labels. Repository run and posted-comment counters are incremented
-    transactionally so concurrent sessions cannot overwrite each other.
+10. Human decisions and actual posted/postability-failure outcomes become
+    SQLite evaluation labels and sanitized Mem0 aggregates. Repository run and
+    posted-comment counters are incremented transactionally so concurrent
+    sessions cannot overwrite each other.
 
 ## Concurrency and persistence
 
@@ -158,6 +174,10 @@ flowchart TD
     RunA --> ImproveStore[ImprovementStore]
     RunB --> ImproveStore
     ImproveStore --> ImproveDB[(improvement.db)]
+
+    RunA --> Semantic[Mem0LongTermMemory]
+    RunB --> Semantic
+    Semantic --> Mem0[(Mem0 Platform<br/>opaque repository scope)]
 ```
 
 Within one run, the orchestrator and separately compiled subagent graphs may
@@ -175,7 +195,11 @@ history, and vice versa.
 SQLite supports concurrent processes sharing one local volume. It is not used
 as a distributed lock across hosts. A multi-host deployment needs sticky access
 to one writer volume or store adapters backed by a managed transactional
-database; agent/VFS state remains isolated per run.
+database; agent/VFS state remains isolated per run. Mem0 is a hosted additive
+layer and can be shared across hosts, but it does not provide transactional
+counter, issue-lifecycle, or feedback-label semantics. Each process deduplicates
+identical same-session Mem0 events; the hosted service remains authoritative for
+cross-process semantic-memory behavior.
 
 ## Configuration and budget semantics
 
@@ -198,6 +222,11 @@ The budget has two enforcement points:
 Budget interruption is recoverable. The graph checkpoint is read after an
 exception and any completed `/findings/` artifacts are returned with an
 incomplete-run health failure rather than discarded.
+
+Configuration constants are imported once per Python process. Streamlit can
+hot-reload `app.py` while retaining an older imported module, so changes to
+`quorum.config`, `.env`, or installed dependencies require a full process
+restart. This is a development-runtime constraint, not a Mem0 fallback path.
 
 ## Packaging and quality gates
 
@@ -328,6 +357,7 @@ adaptations keep the design running on the installed version (`deepagents`
 | Posting | Requires explicit human approval. The agent has no posting tool. |
 | Spend | Exact pre-call count ceiling plus a post-response dollar stop threshold, enforced by one locked middleware instance shared across orchestrator and subagents. |
 | Improvement data | Stores metadata and anchor hashes, never source, patches, PR prose, finding bodies, suggestions, or anchor text. |
+| Mem0 data | Optional hosted storage receives an opaque repository hash and aggregate counts/enums only. Retrieved text is bounded and treated as untrusted; failures fall back to local stores. |
 | Credentials | Read from `.env`, which is git-ignored. Never enter the VFS or a prompt. |
 
 Reviews also fail before model execution if eligible input exceeds the
@@ -344,6 +374,9 @@ the same boundaries apply to editable and installed execution.
   limit is refused instead of truncated.
 - SQLite persistence is safe for concurrent sessions on a shared local volume,
   not for independent multi-host writers without a shared transactional store.
+- Mem0 is optional and best effort. Service unavailability removes semantic
+  history for that operation but never bypasses deterministic validation or
+  loses the local transactional record.
 - The checked-in evaluation pair is a harness smoke test, not a statistically
   meaningful quality benchmark. Production calibration needs multiple
   sanitized golden PR cases with reviewed false-positive and false-negative

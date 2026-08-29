@@ -1,0 +1,60 @@
+%%{init: {"flowchart": {"defaultRenderer": "elk", "nodeSpacing": 35, "rankSpacing": 70}}}%%
+flowchart TB
+    subgraph ReviewRow[1–2. Trusted admission and bounded agent review]
+        direction LR
+        Human([Human reviewer]) --> UI[Streamlit UI<br/>target, profile, threshold]
+        UI --> Loader[Freeze identity, head SHA,<br/>manifest, source, patches]
+        GitHubRead[(GitHub API<br/>read)] --> Loader
+        Loader --> Limits{Within file and<br/>character limits?}
+        Limits -->|no| Refuse[Refuse partial review]
+        Limits -->|yes| VFS[(Immutable VFS<br/>/pr and /patches)]
+        VFS --> Orchestrator[Orchestrator loop<br/>plan, inspect, delegate, synthesize]
+        History[Prior outcomes<br/>trusted SQLite integers +<br/>bounded untrusted Mem0] --> Orchestrator
+        Budget[Shared locked budget<br/>exact call ceiling + cost stop] --> Orchestrator
+        Orchestrator --> Python[Python reviewer<br/>3 skills + Bandit]
+        Orchestrator --> Generic[Generic reviewer<br/>2 skills]
+        Budget --> Python
+        Budget --> Generic
+        Python --> Findings[(Per-file<br/>findings JSON)]
+        Generic --> Findings
+        Refuse --> ReviewExit[Refusal result]
+    end
+
+    subgraph OutcomeRow[3–4. Deterministic validation, human gate, and posting]
+        direction LR
+        Evidence[(Frozen evidence +<br/>per-file findings)]
+        Evidence --> Normalize[Normalize, scope,<br/>merge, deduplicate]
+        Normalize --> Preapprove[Re-anchor on frozen source<br/>reject missing or off-diff anchors]
+        Preapprove --> Health[15 deterministic<br/>health contracts]
+        Health --> Results[Findings, health,<br/>cost, and trace]
+        Results --> Gate{Human approval gate}
+        Gate -->|approved only| Post[Recheck current head, source,<br/>anchor, and added-side diff]
+        Post --> GitHubPost[(GitHub API<br/>one review)]
+        Health --> Signals[Outcome signals<br/>fixed schemas only]
+        Gate --> Signals
+        Post --> Signals
+    end
+
+    subgraph Persistence[5. Long-term evidence and memory]
+        direction LR
+        Stats[(SQLite counters<br/>transactional source of truth)]
+        Improve[(SQLite improvement data<br/>health, issues, labels, eval cases)]
+        Semantic[(Mem0 semantic outcomes<br/>optional and best effort<br/>sanitized aggregates only)]
+    end
+
+    ReviewRow -->|frozen evidence + findings or refusal| OutcomeRow
+    OutcomeRow -->|trusted local records + sanitized Mem0 aggregates| Persistence
+
+    classDef human fill:#e8f5e9,stroke:#2e7d32,color:#173b1c,stroke-width:2px;
+    classDef deterministic fill:#e3f2fd,stroke:#1565c0,color:#102a43,stroke-width:1.5px;
+    classDef agent fill:#fff3e0,stroke:#ef6c00,color:#4e2a00,stroke-width:1.5px;
+    classDef store fill:#f3e5f5,stroke:#7b1fa2,color:#321044,stroke-width:1.5px;
+    classDef guard fill:#fff8e1,stroke:#f9a825,color:#493700,stroke-width:1.5px;
+    classDef stop fill:#ffebee,stroke:#c62828,color:#4f1010,stroke-width:1.5px;
+
+    class Human,UI,Results,Gate human;
+    class Loader,VFS,Evidence,Normalize,Preapprove,Health,Post,Signals deterministic;
+    class History,Orchestrator,Python,Generic,Findings agent;
+    class Stats,Improve,Semantic store;
+    class Limits,Budget guard;
+    class Refuse,ReviewExit stop;
