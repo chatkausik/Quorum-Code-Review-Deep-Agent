@@ -64,8 +64,15 @@ and the decision to post.
 
 ## What it looks like
 
-Captured from a live Economy-profile run against the public sandbox PR
-`chatkausik/Evidensia.AI#7`.
+The composite product view shows the review workspace, finding evidence,
+approval controls, health contracts, recurring issues, and both memory layers
+in one frame.
+
+![Quorum product overview showing findings, evidence, approval controls, health contracts, recurring issues, and Mem0 status](Quorum.png)
+
+_This is an illustrative composite with redacted example values. The focused
+screenshots below were captured from a live Economy-profile run against the
+public sandbox PR `chatkausik/Evidensia.AI#7`._
 
 **Findings are one row each — severity, description, `file:line`, confidence.**
 Rows at or above the threshold arrive pre-selected for posting.
@@ -104,6 +111,7 @@ set, including the empty state and a run in progress.
 
 ```bash
 python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip "setuptools>=83" wheel
 .venv/bin/pip install -e ".[dev]"
 cp .env.example .env      # then fill in GitHub + the selected model provider
 ```
@@ -218,6 +226,7 @@ survive installation.
 To reproduce the package check locally:
 
 ```bash
+.venv/bin/python -m pip install --upgrade "setuptools>=83"
 .venv/bin/python -m build
 .venv/bin/pip-audit
 ```

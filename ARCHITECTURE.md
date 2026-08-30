@@ -80,6 +80,16 @@ Arrows crossing out of the agentic plane carry findings or usage telemetry,
 not authority. Models cannot select a different target, change frozen evidence,
 write persistent stores, or reach the GitHub posting API.
 
+### Product surface
+
+![Quorum composite interface showing the review workspace, deterministic health checks, approval gate, and memory status](Quorum.png)
+
+The illustrative composite maps those architectural boundaries to the product
+surface: evidence-backed findings remain separate from health-contract status,
+human selection controls posting, and Mem0 is visibly distinct from the local
+database. Redacted example values are presentation data, not recorded run
+evidence.
+
 ## Component reference
 
 | Component | Type | LLM calls | Responsibility |
@@ -254,7 +264,9 @@ CI is fully offline through the test/evaluation stages. It requires the Ruff
 rules configured in `pyproject.toml`, the 65% branch-aware coverage floor, and
 perfect precision, recall, F1, and anchor accuracy on the checked-in smoke
 fixture before building. `pip-audit` is the only gate that needs vulnerability
-advisory data from the network.
+advisory data from the network. The runner explicitly upgrades to
+`setuptools>=83` before editable installation, and the same security floor is
+declared for PEP 517 build isolation and the development dependency set.
 
 ## Deviations from the specification
 

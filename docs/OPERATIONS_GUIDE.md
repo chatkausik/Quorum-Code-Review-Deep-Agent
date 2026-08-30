@@ -523,14 +523,23 @@ and [evaluation guide](../evals/README.md).
 
 ## UI screenshots
 
-Captured from a live run against the public sandbox pull request
-`chatkausik/Evidensia.AI#7` at a 1600x1000 viewport, Economy profile, Anthropic
-provider. The Streamlit developer toolbar is hidden in these captures; nothing
-else is edited. The Improve captures predate the addition of
-`diff_availability` and `finding_postability`, so their visible totals show 13
-rather than the current 15 checks. They document layout and issue interaction,
-not the current contract count. `ui-empty.png` in the repository root is an
-older layout relic that predates the **Improve** tab.
+### Composite product view
+
+![Quorum composite product view with finding evidence, posting controls, health contracts, recurring issues, and memory status](../Quorum.png)
+
+The composite is an illustrative overview with redacted example values. It
+shows how findings, evidence, approval, health, recurring issues, and memory
+status fit together; use the focused captures below as evidence of the running
+implementation.
+
+The following screenshots were captured from a live run against the public
+sandbox pull request `chatkausik/Evidensia.AI#7` at a 1600x1000 viewport,
+Economy profile, Anthropic provider. The Streamlit developer toolbar is hidden
+in these captures; nothing else is edited. The Improve captures predate the
+addition of `diff_availability` and `finding_postability`, so their visible
+totals show 13 rather than the current 15 checks. They document layout and issue
+interaction, not the current contract count. `ui-empty.png` in the repository
+root is an older layout relic that predates the **Improve** tab.
 
 ### Empty state
 
@@ -635,10 +644,12 @@ For recurring failures:
 
 Before a release:
 
-1. Run Ruff, the coverage-enabled test suite, and the offline evaluation gates.
-2. Build both wheel and source distribution.
-3. Install the wheel outside the checkout and verify `quorum-review` can find
+1. Upgrade the audited build toolchain with
+   `.venv/bin/python -m pip install --upgrade "setuptools>=83"`.
+2. Run Ruff, the coverage-enabled test suite, and the offline evaluation gates.
+3. Build both wheel and source distribution.
+4. Install the wheel outside the checkout and verify `quorum-review` can find
    `app.py` and all five skills.
-4. Run `pip-audit` with current advisory data.
-5. Review configuration, tracing retention, shared-volume, and database plans
+5. Run `pip-audit` with current advisory data.
+6. Review configuration, tracing retention, shared-volume, and database plans
    for the deployment environment, including Mem0 data retention and access.
